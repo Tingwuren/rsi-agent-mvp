@@ -1,0 +1,65 @@
+experiment:
+  name: "qwen3_8b_mbpp_plus_mvp"
+  seed: 42
+  workspace_root: "${RSI_WORKSPACE_ROOT:-/mnt/data0/Projects/rsi-agent-mvp/.workspace}"
+  output_dir: "${RSI_WORKSPACE_ROOT:-/mnt/data0/Projects/rsi-agent-mvp/.workspace}/runs"
+
+hardware:
+  mode: "single_gpu_timeshare"
+  serving_gpus: [1]
+  training_gpus: [1]
+
+model:
+  base_model: "Qwen/Qwen3-8B"
+  vllm_host: "127.0.0.1"
+  vllm_port: 8000
+  api_key_env: "RSI_LLM_API_KEY"
+  base_url_env: "RSI_LLM_BASE_URL"
+  max_model_len: 16384
+  enable_lora: true
+  temperature: 0.2
+
+task:
+  adapter: "code"
+  verifier: "ground_truth_code"
+  num_samples_per_task: 1
+
+dataset:
+  provider: "jsonl"
+  path: "${RSI_WORKSPACE_ROOT:-/mnt/data0/Projects/rsi-agent-mvp/.workspace}/datasets/mbpp_plus"
+  mini_eval_size: 32
+  full_eval_top_k: 2
+  max_concurrency: 8
+
+evolution:
+  max_generations: 5
+  selection_policy: "evolutionary_archive"
+  holdout_eval_interval: 5
+  early_stop_patience: 4
+  max_files_per_mutation: 3
+  max_failed_traces_in_context: 4
+
+weight_adaptation:
+  enabled: false
+  trigger_every_n_generations: 5
+  method: "sft_lora"
+  min_train_samples: 50
+  min_confidence: 0.7
+  lora_r: 16
+  lora_alpha: 32
+  learning_rate: 1.0e-4
+  num_epochs: 2
+  replay_ratio: 0.2
+
+guardrails:
+  anchor_enabled: true
+  max_anchor_drop: 0.03
+  max_total_tokens: 1000000
+  min_free_disk_gb: 5.0
+
+sandbox:
+  backend: "subprocess"
+  docker_image: "python:3.11-slim"
+  task_timeout_sec: 30
+  improve_timeout_sec: 90
+  memory_limit: "1g"

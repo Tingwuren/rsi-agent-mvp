@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rsi-agent-mvp"
+version = "0.1.0"
+description = "Recursive Self-Improvement (RSI) Agent MVP with dual-track scaffold + LoRA evolution"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7,<3.0",
+    "PyYAML>=6.0",
+    "openai>=1.40",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-PyYAML>=6.0",
+]
+data = [
+    "datasets>=2.20",
+    "pyarrow>=16.0",
+    "sympy>=1.13",
+]
+gpu = [
+    "transformers>=4.51",
+    "peft>=0.14",
+    "trl>=0.15",
+    "accelerate>=1.2",
+    "vllm>=0.8.0",
+]
+
+[project.scripts]
+rsi = "rsi_mvp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "gpu_live: marks tests requiring a live local GPU and model server",
+]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
