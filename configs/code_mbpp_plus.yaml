@@ -59,7 +59,7 @@ guardrails:
 
 sandbox:
   backend: "subprocess"
-  docker_image: "python:3.11-slim"
+  docker_image: "rsi-sandbox:py311"
   task_timeout_sec: 30
   improve_timeout_sec: 90
   memory_limit: "1g"

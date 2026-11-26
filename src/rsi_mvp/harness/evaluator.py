@@ -12,6 +12,7 @@ from typing import Any
 
 from rsi_mvp.harness.adapters import TaskAdapter
 from rsi_mvp.harness.llm import BaseLLMClient, BudgetExceededError
+from rsi_mvp.harness.sandbox import LLMBackendSpec, SandboxExecutor
 from rsi_mvp.harness.verifiers import Verifier
 from rsi_mvp.schemas import (
     CandidateOutput,
@@ -23,6 +24,38 @@ from rsi_mvp.schemas import (
 )
 
 SolveFn = Callable[[dict[str, Any], BaseLLMClient], dict[str, Any]]
+
+
+def make_sandboxed_solve_fn(
+    snapshot_dir: Path,
+    sandbox: SandboxExecutor,
+    llm_spec: LLMBackendSpec,
+    timeout_sec: int = 60,
+) -> SolveFn:
+    """Wrap an untrusted candidate snapshot so ``solve()`` executes inside ``SandboxExecutor``."""
+
+    def _sandboxed_solve(task_input: dict[str, Any], _llm_client: BaseLLMClient) -> dict[str, Any]:
+        res = sandbox.run_agent_solve(
+            snapshot_dir=snapshot_dir,
+            task_input=task_input,
+            llm_spec=llm_spec,
+            timeout_sec=timeout_sec,
+        )
+        if not res.ok or res.payload is None:
+            reason = (
+                f"Sandbox timeout after {timeout_sec}s"
+                if res.timed_out
+                else (res.stderr or res.stdout or f"Sandbox exit_code={res.exit_code}")
+            )
+            return TaskSolution(
+                task_id=str(task_input["task_id"]),
+                outputs=[CandidateOutput(raw_text="", extracted_answer="")],
+                error=reason,
+                elapsed_sec=res.elapsed_sec,
+            ).model_dump()
+        return res.payload
+
+    return _sandboxed_solve
 
 
 def evaluate_single_task(

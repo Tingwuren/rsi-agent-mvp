@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import re
-import subprocess
-import sys
-import tempfile
-import time
-from pathlib import Path
 
 from rsi_mvp.harness.adapters.code import extract_python_code
 from rsi_mvp.harness.adapters.math import extract_boxed_answer
+from rsi_mvp.harness.sandbox import SandboxExecutor, SubprocessSandbox
 from rsi_mvp.harness.verifiers.base import register_verifier
 from rsi_mvp.schemas import FailureType, TaskSolution, TaskSpec, VerifyResult
 
@@ -28,21 +23,35 @@ def _truncate(text: str, limit: int = _MAX_DIAG_CHARS) -> str:
     return f"{text[:half]}\n...[truncated]...\n{text[-half:]}"
 
 
+_RUNTIME_ERR_RE = re.compile(
+    r"^\s*E\s+(?:NameError|TypeError|ValueError|ZeroDivisionError|IndexError|"
+    r"KeyError|AttributeError|RecursionError|ImportError|ModuleNotFoundError|"
+    r"RuntimeError|MemoryError|OverflowError)\b",
+    flags=re.MULTILINE,
+)
+_ASSERT_ERR_RE = re.compile(r"^\s*E\s+(?:AssertionError\b|assert\s)", flags=re.MULTILINE)
+
+
 def _classify_pytest_failure(output: str, timed_out: bool) -> FailureType:
     if timed_out:
         return "timeout"
     if "SyntaxError" in output or "IndentationError" in output:
         return "syntax_error"
-    if "AssertionError" in output or "assert " in output:
+    if _RUNTIME_ERR_RE.search(output):
+        return "runtime_error"
+    if _ASSERT_ERR_RE.search(output) or "AssertionError" in output:
         return "assertion_error"
     return "runtime_error"
 
 
 class GroundTruthCodeVerifier:
-    """Evaluates generated Python code against immutable pytest tests in a clean temp dir."""
+    """Evaluates generated Python code against immutable pytest tests inside a sandbox."""
 
     mode_name = "ground_truth_code"
     is_label_free = False
+
+    def __init__(self, sandbox: SandboxExecutor | None = None) -> None:
+        self._sandbox: SandboxExecutor = sandbox or SubprocessSandbox()
 
     def verify(self, spec: TaskSpec, solution: TaskSolution) -> VerifyResult:
         if solution.error:
@@ -82,62 +91,15 @@ class GroundTruthCodeVerifier:
                 elapsed_sec=solution.elapsed_sec,
             )
 
-        start = time.perf_counter()
-        tmp_base = os.environ.get("TMPDIR")
-        with tempfile.TemporaryDirectory(prefix="rsi_eval_", dir=tmp_base) as tmpdir:
-            work = Path(tmpdir)
-            (work / entry_file).write_text(code, encoding="utf-8")
-            (work / "test_solution.py").write_text(test_code, encoding="utf-8")
+        sbx_res = self._sandbox.run_pytest_eval(
+            solution_code=code,
+            entry_file=entry_file,
+            test_code=test_code,
+            timeout_sec=spec.timeout_sec,
+        )
+        combined = (sbx_res.stdout + "\n" + sbx_res.stderr).strip()
 
-            env = {
-                "PATH": os.environ.get("PATH", ""),
-                "PYTHONPATH": str(work),
-                "PYTHONDONTWRITEBYTECODE": "1",
-                "TMPDIR": tmpdir,
-            }
-            cmd = [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                "--tb=short",
-                "--no-header",
-                "-o",
-                "addopts=",
-                str(work / "test_solution.py"),
-            ]
-            timed_out = False
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    cwd=work,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=spec.timeout_sec,
-                    check=False,
-                )
-                combined = (proc.stdout + "\n" + proc.stderr).strip()
-                returncode = proc.returncode
-            except subprocess.TimeoutExpired as exc:
-                timed_out = True
-                raw_out = exc.stdout
-                raw_err = exc.stderr
-                out_str = (
-                    raw_out.decode("utf-8", "replace")
-                    if isinstance(raw_out, bytes)
-                    else (raw_out or "")
-                )
-                err_str = (
-                    raw_err.decode("utf-8", "replace")
-                    if isinstance(raw_err, bytes)
-                    else (raw_err or "")
-                )
-                combined = f"Timed out after {spec.timeout_sec}s\n{out_str}\n{err_str}".strip()
-                returncode = -1
-
-        elapsed = time.perf_counter() - start
-        if not timed_out and returncode == 0:
+        if sbx_res.ok and not sbx_res.tampered:
             return VerifyResult(
                 task_id=spec.task_id,
                 passed=True,
@@ -147,7 +109,20 @@ class GroundTruthCodeVerifier:
                 failure_type="none",
                 diagnostics=_truncate(combined),
                 tokens_used=solution.total_tokens,
-                elapsed_sec=solution.elapsed_sec + elapsed,
+                elapsed_sec=solution.elapsed_sec + sbx_res.elapsed_sec,
+            )
+
+        if sbx_res.tampered:
+            return VerifyResult(
+                task_id=spec.task_id,
+                passed=False,
+                score=0.0,
+                confidence=1.0,
+                is_label_free=False,
+                failure_type="runtime_error",
+                diagnostics=_truncate(combined),
+                tokens_used=solution.total_tokens,
+                elapsed_sec=solution.elapsed_sec + sbx_res.elapsed_sec,
             )
 
         # Compute partial score if pytest reported passed/failed counts
@@ -166,10 +141,10 @@ class GroundTruthCodeVerifier:
             score=round(partial, 4),
             confidence=1.0,
             is_label_free=False,
-            failure_type=_classify_pytest_failure(combined, timed_out=timed_out),
+            failure_type=_classify_pytest_failure(combined, timed_out=sbx_res.timed_out),
             diagnostics=_truncate(combined),
             tokens_used=solution.total_tokens,
-            elapsed_sec=solution.elapsed_sec + elapsed,
+            elapsed_sec=solution.elapsed_sec + sbx_res.elapsed_sec,
         )
 
 

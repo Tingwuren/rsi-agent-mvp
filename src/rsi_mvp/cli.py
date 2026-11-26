@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import subprocess
@@ -17,8 +16,9 @@ from rsi_mvp.config import load_dotenv_file, load_experiment_config
 from rsi_mvp.doctor import DoctorReport, run_doctor
 from rsi_mvp.harness.adapters import get_adapter
 from rsi_mvp.harness.data import create_dataset_provider
-from rsi_mvp.harness.evaluator import SolveFn, evaluate_suite
+from rsi_mvp.harness.evaluator import SolveFn, evaluate_suite, make_sandboxed_solve_fn
 from rsi_mvp.harness.llm import BaseLLMClient, MockLLMClient, OpenAICompatibleClient
+from rsi_mvp.harness.sandbox import LLMBackendSpec, create_sandbox
 from rsi_mvp.harness.verifiers import get_verifier
 from rsi_mvp.schemas import EvalSplitType, SplitType
 
@@ -66,19 +66,6 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if report.has_failures else 0
 
 
-def _load_snapshot_solve(snapshot_dir: Path) -> SolveFn:
-    """Dynamically load ``solve`` from a candidate snapshot's ``agent/core.py``."""
-    agent_init = snapshot_dir / "agent" / "__init__.py"
-    if not agent_init.is_file():
-        raise FileNotFoundError(f"Snapshot agent package not found: {agent_init}")
-    spec = importlib.util.spec_from_file_location("rsi_snapshot_agent", agent_init)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load snapshot from {agent_init}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.solve
-
-
 def _cmd_eval(args: argparse.Namespace) -> int:
     dotenv = Path(".env")
     if dotenv.is_file():
@@ -120,9 +107,31 @@ def _cmd_eval(args: argparse.Namespace) -> int:
             max_total_tokens=cfg.guardrails.max_total_tokens,
         )
 
-    solve_fn: SolveFn = (
-        _load_snapshot_solve(Path(args.snapshot)) if args.snapshot else default_agent_solve
-    )
+    if args.snapshot:
+        sandbox = create_sandbox(cfg.sandbox, tmp_root=Path(cfg.experiment.workspace_root) / "tmp")
+        if args.mock:
+            llm_spec = LLMBackendSpec(mode="mock", mock_responses=["```python\npass\n```"])
+        else:
+            model_name = args.lora or cfg.model.base_model
+            base_url = os.environ.get(
+                cfg.model.base_url_env,
+                f"http://{cfg.model.vllm_host}:{cfg.model.vllm_port}/v1",
+            )
+            api_key = os.environ.get(cfg.model.api_key_env, "EMPTY")
+            llm_spec = LLMBackendSpec(
+                mode="openai_http",
+                base_url=base_url,
+                api_key=api_key,
+                model=model_name,
+            )
+        solve_fn: SolveFn = make_sandboxed_solve_fn(
+            snapshot_dir=Path(args.snapshot),
+            sandbox=sandbox,
+            llm_spec=llm_spec,
+            timeout_sec=max(cfg.sandbox.task_timeout_sec, 60),
+        )
+    else:
+        solve_fn = default_agent_solve
     traces_dir = Path(args.output) / "traces" if args.output else None
 
     summary = evaluate_suite(

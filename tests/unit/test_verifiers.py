@@ -67,6 +67,27 @@ def test_code_verifier_pass_fail_syntax_and_timeout() -> None:
     assert res_to.passed is False
     assert res_to.failure_type == "timeout"
 
+    # NameError inside an `assert add(...) == ...` line must be classified as runtime_error
+    wrong_name_sol = TaskSolution(
+        task_id="add_task",
+        outputs=[
+            CandidateOutput(raw_text="", extracted_answer="def wrong_fn(a, b):\n    return a + b\n")
+        ],
+    )
+    res_name = verifier.verify(spec, wrong_name_sol)
+    assert res_name.passed is False
+    assert res_name.failure_type == "runtime_error"
+
+    div_zero_sol = TaskSolution(
+        task_id="add_task",
+        outputs=[
+            CandidateOutput(raw_text="", extracted_answer="def add(a, b):\n    return a / 0\n")
+        ],
+    )
+    res_div = verifier.verify(spec, div_zero_sol)
+    assert res_div.passed is False
+    assert res_div.failure_type == "runtime_error"
+
 
 def test_math_verifier_symbolic_equivalence() -> None:
     assert math_answers_equivalent(r"\frac{1}{2}", "0.5")

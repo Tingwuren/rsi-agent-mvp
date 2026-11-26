@@ -338,7 +338,7 @@ class GuardrailsConfig(BaseModel):
 
 class SandboxConfig(BaseModel):
     backend: Literal["subprocess", "docker"] = "subprocess"
-    docker_image: str = "python:3.11-slim"
+    docker_image: str = "rsi-sandbox:py311"
     task_timeout_sec: int = Field(default=30, ge=1)
     improve_timeout_sec: int = Field(default=90, ge=1)
     memory_limit: str = "1g"
