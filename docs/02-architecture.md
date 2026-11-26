@@ -10,6 +10,7 @@
 基于当前宿主机实测状态（6 × RTX 5090 32 GB、1 TB RAM、`/` 仅剩 ~630 MB、`/mnt/data0` 可用 254 GB），系统按以下物理资源策略运行：
 
 ### 1.1 存储目录隔离规范（强制）
+
 所有大容量文件全部统一规划在 `/mnt/data0/rsi-workspace/` 下，并通过环境变量注入，绝不污染系统盘 `/`：
 
 ```text
@@ -22,6 +23,7 @@
 ```
 
 ### 1.2 GPU 双调度模式（单卡保底 + 多卡无缝扩展）
+
 - **模式 A：单卡分时模式（Single-GPU Time-Sharing，MVP 默认，绑定空闲 GPU 1）**
   - *推理/进化期*：独占 GPU 1 启动 `vLLM`（BF16 `Qwen3-8B` ~16 GB + KV Cache ~12 GB + `--enable-lora`）。
   - *微调期*：由 `ModelLifecycleManager` 优雅关闭 `vLLM` 确认显存归零 → 启动单卡 BF16 LoRA SFT（`gradient_checkpointing=True`，峰值 ~24–28 GB）→ 导出轻量 `adapter_vN` → 重启 `vLLM` 并热挂载新 Adapter。
@@ -118,16 +120,16 @@ stateDiagram-v2
 
 ## 5. 核心子系统职责与扩展设计
 
-| 子系统 | 所在路径 | 核心职责 | 泛用性 / 关键设计要点 |
-| :--- | :--- | :--- | :--- |
-| **Orchestrator** | `harness/loop.py` | 驱动双轨进化状态机、触发 LoRA 微调、断点续跑 | 轨道 A（Scaffold）与轨道 B（Weight）均可在配置中独立开关 |
-| **DatasetProvider** | `harness/data.py` | 统一加载 `train/dev/holdout/anchor`，支持大数据集流式与分层子采样 | 封装 HF `datasets`（Arrow/Parquet）；通过固定随机种子支持可复现的 `dev_mini` 漏斗 |
-| **TaskAdapter** | `harness/adapters/` | 负责特定任务域的 Prompt 渲染与输出提取 | 注册表模式；内置 `code`（MBPP+/BigCodeBench）、`math`（MATH-500）、`qa` |
-| **Verifier** | `harness/verifiers/` | 为每道题输出验证得分、置信度与诊断日志 | 统一兼容有标签（`pytest`/`math-verify`）与无标签（`Consensus` / `CodeTestCo` / `Rubric`） |
-| **ModelLifecycle** | `harness/lifecycle.py` | 管理本地 `vLLM` 服务、动态 LoRA 注册与显存切换 | 支持单卡分时（stop vLLM → train → restart）与多卡并行，也支持外部 API 直连模式 |
-| **TrainerBackend** | `harness/trainer.py` | 将筛选后的 Train 轨迹转为微调数据并运行 LoRA 训练 | 默认实现 `TRLLoRASFTTrainer`（BF16 LoRA + KL/Replay 防坍缩），预留 DPO / GRPO 接口 |
-| **Sandbox & Patcher** | `harness/sandbox.py`, `patcher.py` | 隔离执行不可信代码、校验补丁白名单与双入口契约 | Subprocess / Docker 双模式；进程间采用临时目录 JSON 文件通信防 stdout 污染 |
-| **Archive & Anchor** | `harness/archive.py` | SQLite 持久化双轨谱系，执行父代采样与 Anchor 门禁 | 同时记录 `(scaffold_snapshot_id, lora_adapter_id)` 组合坐标 |
+| 子系统                      | 所在路径                               | 核心职责                                                            | 泛用性 / 关键设计要点                                                                               |
+| :-------------------------- | :------------------------------------- | :------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------- |
+| **Orchestrator**      | `harness/loop.py`                    | 驱动双轨进化状态机、触发 LoRA 微调、断点续跑                        | 轨道 A（Scaffold）与轨道 B（Weight）均可在配置中独立开关                                            |
+| **DatasetProvider**   | `harness/data.py`                    | 统一加载 `train/dev/holdout/anchor`，支持大数据集流式与分层子采样 | 封装 HF `datasets`（Arrow/Parquet）；通过固定随机种子支持可复现的 `dev_mini` 漏斗               |
+| **TaskAdapter**       | `harness/adapters/`                  | 负责特定任务域的 Prompt 渲染与输出提取                              | 注册表模式；内置 `code`（MBPP+/BigCodeBench）、`math`（MATH-500）、`qa`                       |
+| **Verifier**          | `harness/verifiers/`                 | 为每道题输出验证得分、置信度与诊断日志                              | 统一兼容有标签（`pytest`/`math-verify`）与无标签（`Consensus` / `CodeTestCo` / `Rubric`） |
+| **ModelLifecycle**    | `harness/lifecycle.py`               | 管理本地 `vLLM` 服务、动态 LoRA 注册与显存切换                    | 支持单卡分时（stop vLLM → train → restart）与多卡并行，也支持外部 API 直连模式                    |
+| **TrainerBackend**    | `harness/trainer.py`                 | 将筛选后的 Train 轨迹转为微调数据并运行 LoRA 训练                   | 默认实现 `TRLLoRASFTTrainer`（BF16 LoRA + KL/Replay 防坍缩），预留 DPO / GRPO 接口                |
+| **Sandbox & Patcher** | `harness/sandbox.py`, `patcher.py` | 隔离执行不可信代码、校验补丁白名单与双入口契约                      | Subprocess / Docker 双模式；进程间采用临时目录 JSON 文件通信防 stdout 污染                          |
+| **Archive & Anchor**  | `harness/archive.py`                 | SQLite 持久化双轨谱系，执行父代采样与 Anchor 门禁                   | 同时记录 `(scaffold_snapshot_id, lora_adapter_id)` 组合坐标                                       |
 
 ---
 
@@ -194,10 +196,10 @@ rsi-agent-mvp/
 
 ## 8. 架构决策记录（ADR 摘要）
 
-| 决策项 | 选型 | 理由 |
-| :--- | :--- | :--- |
-| **主力基座模型** | `Qwen3-8B`（备选 `Qwen2.5-Coder-7B-Instruct`） | BF16 ~16 GB 完美契合单卡 32 GB RTX 5090；兼具强编码、数学、工具调用与思考开关，满足多任务泛用性；本机已缓存的 `DeepSeek-R1-Distill-Qwen-7B` 可先作零下载烟测。 |
-| **推理与权重热切** | `vLLM` + `--enable-lora` | OpenAI 兼容协议解耦上层代码；多代 LoRA Adapter 仅占几十 MB 且支持动态加载，节省磁盘与重启开销。 |
-| **微调方案** | `PEFT` + `TRL`（首期 LoRA SFT，预留 DPO/GRPO） | 轻量化 Python 原生集成，单卡 32 GB 运行 BF16 LoRA 稳定可控，支持 KL/Replay 防坍缩。 |
-| **大数据集供给** | HuggingFace `datasets` + `Mini→Full` 漏斗 | Arrow 内存映射支持十万级数据不爆内存；两级评测保证大型数据集上每代迭代仍保持分钟级反馈。 |
-| **无标签验证策略** | 可插拔 `LabelFreeVerifier` + `Anchor Gatekeeper` | 避免纯自评导致模型坍缩；通过共识/交叉验证提供接地信号，由极小金标准锚点集把控安全底线。 |
+| 决策项                   | 选型                                                 | 理由                                                                                                                                                             |
+| :----------------------- | :--------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **主力基座模型**   | `Qwen3-8B`（备选 `Qwen2.5-Coder-7B-Instruct`）   | BF16 ~16 GB 完美契合单卡 32 GB RTX 5090；兼具强编码、数学、工具调用与思考开关，满足多任务泛用性；本机已缓存的 `DeepSeek-R1-Distill-Qwen-7B` 可先作零下载烟测。 |
+| **推理与权重热切** | `vLLM` + `--enable-lora`                         | OpenAI 兼容协议解耦上层代码；多代 LoRA Adapter 仅占几十 MB 且支持动态加载，节省磁盘与重启开销。                                                                  |
+| **微调方案**       | `PEFT` + `TRL`（首期 LoRA SFT，预留 DPO/GRPO）   | 轻量化 Python 原生集成，单卡 32 GB 运行 BF16 LoRA 稳定可控，支持 KL/Replay 防坍缩。                                                                              |
+| **大数据集供给**   | HuggingFace `datasets` + `Mini→Full` 漏斗       | Arrow 内存映射支持十万级数据不爆内存；两级评测保证大型数据集上每代迭代仍保持分钟级反馈。                                                                         |
+| **无标签验证策略** | 可插拔 `LabelFreeVerifier` + `Anchor Gatekeeper` | 避免纯自评导致模型坍缩；通过共识/交叉验证提供接地信号，由极小金标准锚点集把控安全底线。                                                                          |

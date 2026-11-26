@@ -10,6 +10,7 @@
 ## 1. 任务无关的核心数据模型（`src/rsi_mvp/schemas.py`）
 
 ### 1.1 通用任务规格（`TaskSpec` & `TaskInput`）
+
 不再写死为 Python 代码字段，而是通过 `domain` 与 `payload` 适配任意任务，同时允许 `ground_truth = None` 支持无标签数据集：
 
 ```python
@@ -156,6 +157,7 @@ class CandidateRecord(BaseModel):
 ## 2. 核心可扩展接口契约（Protocols / ABCs）
 
 ### 2.1 数据供给层（`DatasetProvider`）
+
 ```python
 class DatasetProvider(Protocol):
     def get_split(
@@ -173,6 +175,7 @@ class DatasetProvider(Protocol):
 ```
 
 ### 2.2 任务适配器与验证器（`TaskAdapter` & `Verifier`）
+
 ```python
 class TaskAdapter(Protocol):
     domain: str
@@ -190,12 +193,14 @@ class Verifier(Protocol):
 ```
 
 内置 Verifier 行为规范：
+
 1. **`GroundTruthCodeVerifier`**：提取代码至干净临时目录，注入 `spec.ground_truth["test_code"]` 跑隔离 `pytest`。
 2. **`GroundTruthMathVerifier`**：使用 `math-verify` / `sympy` 对比提取答案与 `spec.ground_truth["answer"]`。
 3. **`ConsensusVerifier`（无标签）**：对 `solution.outputs`（$K \ge 4$）按规范化等价类投票，计算 `consensus_ratio = max_votes / K`。若 `consensus_ratio >= min_consensus`（默认 0.6），标记 `passed=True` 并写入 `pseudo_label`；否则标 `low_consensus` 拒绝进入微调池。
 4. **`CodeTestCoVerifier`（无标签代码）**：构建 $M$ 份候选代码 × $N$ 份候选测试的执行矩阵 $A \in \{0, 1\}^{M \times N}$，剔除全 0/全 1 的退化测试后，按行列一致度选取最优解并计算 `confidence`。
 
 ### 2.3 模型生命周期与微调后端（`ModelLifecycleManager` & `TrainerBackend`）
+
 ```python
 class ModelLifecycleManager(Protocol):
     def ensure_serving(self, active_lora: LoRAAdapterRecord | None = None) -> BaseLLMClient:
@@ -220,6 +225,7 @@ class TrainerBackend(Protocol):
 ```
 
 ### 2.4 可变 Agent 标准契约（`agent/`）
+
 ```python
 def solve(task: dict, llm_client: BaseLLMClient) -> dict:
     """输入 TaskInput dict，输出 TaskSolution dict（支持 num_samples >= 1）。"""
@@ -233,19 +239,30 @@ def propose_improvement(context: dict, llm_client: BaseLLMClient) -> dict:
 ## 3. 补丁校验、双轨选择与锚点门禁算法
 
 ### 3.1 补丁校验与双入口冒烟（`harness/patcher.py`）
+
 1. 校验编辑文件数 `1 <= len(edits) <= max_files_per_mutation`（默认 3）。
 2. 路径白名单 + 防 Symlink 逃逸校验（严格限定 `candidate_agent_dir` 内部）。
 3. `replace_block` 要求 `search` 唯一精确匹配；应用后执行 `ast.parse()` 并生成 `patch.diff`。
 4. 沙箱注入 `MockLLMClient` 分别验证 `solve()` 与 `propose_improvement()` 能在 5s 内返回合法 Schema。
 
 ### 3.2 开放式进化选择策略（`evolutionary_archive`）
+
 对候选池中状态为 `accepted` 的个体 $i$ 计算父代采样权重（优先取 `dev_full_score`，若无则取 `dev_mini_score`）：
-$$w_i = \frac{\text{sigmoid}\!\left(\lambda \cdot (s_i - \bar{s})\right)}{1 + \alpha \cdot n_i}$$
+
+$$
+w_i = \frac{\text{sigmoid}\!\left(\lambda \cdot (s_i - \bar{s})\right)}{1 + \alpha \cdot n_i}
+$$
+
 其中 $\lambda = 5.0$ 控制性能偏好，$\alpha = 0.5$ 惩罚重复抽样次数 $n_i$。同时支持切换为基线 `hill_climbing` 策略。
 
 ### 3.3 Anchor Gatekeeper 门禁规则
+
 当启用无标签模式或完成一轮 LoRA 微调后，强制触发 `anchor` 集评估：
-$$\Delta_{\text{anchor}} = \text{Score}_{\text{anchor}}(\text{new}) - \text{Score}_{\text{anchor}}(\text{baseline})$$
+
+$$
+\Delta_{\text{anchor}} = \text{Score}_{\text{anchor}}(\text{new}) - \text{Score}_{\text{anchor}}(\text{baseline})
+$$
+
 - 若 $\Delta_{\text{anchor}} < -\text{max\_anchor\_drop}$（默认 `-0.03`），直接标记 `rejected_anchor_drop`，阻止该 Scaffold 或 LoRA 成为活跃版本，防止静默退化与模型坍缩。
 
 ---
@@ -321,13 +338,13 @@ sandbox:
 
 ## 5. CLI 命令规范（`src/rsi_mvp/cli.py`）
 
-| 命令 | 说明 | 示例 |
-| :--- | :--- | :--- |
-| `rsi doctor` | 检查 GPU 空闲状态、CUDA/`sm_120` 兼容性、`/mnt/data0` 磁盘余量与 `HF_HOME` 配置 | `rsi doctor` |
-| `rsi serve` | 按配置在指定 GPU 启动/停止本地 vLLM（带 `--enable-lora`） | `rsi serve --config configs/code_bigcodebench.yaml` |
-| `rsi run` | 启动或恢复双轨 RSI 进化实验 | `rsi run --config configs/code_bigcodebench.yaml` |
-| `rsi eval` | 对指定 `(snapshot, lora)` 组合运行 `dev/holdout/anchor` 评测 | `rsi eval --snapshot ... --lora lora_0001 --split holdout` |
-| `rsi train-lora` | 手动从指定实验 Trace 导出训练集并执行一轮单卡 LoRA 微调 | `rsi train-lora --run runs/<exp_id>` |
-| `rsi inspect` | 展示双轨谱系表（Scaffold + LoRA 版本、Dev/Anchor/Holdout 曲线） | `rsi inspect --run runs/<exp_id>` |
-| `rsi diff` | 对比任意两个候选体的代码 Diff 与指标变化 | `rsi diff --run runs/<exp_id> cand_0000 cand_0005` |
-| `rsi report` | 生成或刷新 `summary.md` 实验分析报告 | `rsi report --run runs/<exp_id>` |
+| 命令               | 说明                                                                                  | 示例                                                         |
+| :----------------- | :------------------------------------------------------------------------------------ | :----------------------------------------------------------- |
+| `rsi doctor`     | 检查 GPU 空闲状态、CUDA/`sm_120` 兼容性、`/mnt/data0` 磁盘余量与 `HF_HOME` 配置 | `rsi doctor`                                               |
+| `rsi serve`      | 按配置在指定 GPU 启动/停止本地 vLLM（带 `--enable-lora`）                           | `rsi serve --config configs/code_bigcodebench.yaml`        |
+| `rsi run`        | 启动或恢复双轨 RSI 进化实验                                                           | `rsi run --config configs/code_bigcodebench.yaml`          |
+| `rsi eval`       | 对指定 `(snapshot, lora)` 组合运行 `dev/holdout/anchor` 评测                      | `rsi eval --snapshot ... --lora lora_0001 --split holdout` |
+| `rsi train-lora` | 手动从指定实验 Trace 导出训练集并执行一轮单卡 LoRA 微调                               | `rsi train-lora --run runs/<exp_id>`                       |
+| `rsi inspect`    | 展示双轨谱系表（Scaffold + LoRA 版本、Dev/Anchor/Holdout 曲线）                       | `rsi inspect --run runs/<exp_id>`                          |
+| `rsi diff`       | 对比任意两个候选体的代码 Diff 与指标变化                                              | `rsi diff --run runs/<exp_id> cand_0000 cand_0005`         |
+| `rsi report`     | 生成或刷新 `summary.md` 实验分析报告                                                | `rsi report --run runs/<exp_id>`                           |
