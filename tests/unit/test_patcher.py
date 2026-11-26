@@ -28,7 +28,7 @@ def test_tc_patch_01_replace_block_and_full_smoke_pass(tmp_path: Path) -> None:
         rationale="General improvement across Python coding tasks.",
         edits=[
             FileEdit(
-                target_path="prompts.py",
+                target_path="agent/prompts.py",
                 mode="replace_block",
                 search="Carefully read the specification and edge cases.",
                 replace="Carefully read the specification, empty inputs, and boundary edge cases.",

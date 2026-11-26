@@ -185,6 +185,9 @@ class FileEdit(BaseModel):
         pure = PurePosixPath(normalized)
         if pure.is_absolute() or ".." in pure.parts:
             raise ValueError(f"target_path must be a safe relative path, got: {value!r}")
+        # Strip optional redundant leading "agent/" prefix emitted by LLMs (e.g. "agent/tools.py")
+        if len(pure.parts) >= 2 and pure.parts[0] == "agent":
+            pure = PurePosixPath(*pure.parts[1:])
         if pure.suffix not in ALLOWED_EDIT_EXTENSIONS:
             raise ValueError(
                 f"target_path extension {pure.suffix!r} not in allowed set "

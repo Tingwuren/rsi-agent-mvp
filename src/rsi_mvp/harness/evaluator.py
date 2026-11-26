@@ -10,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
+
 from rsi_mvp.harness.adapters import TaskAdapter
 from rsi_mvp.harness.llm import BaseLLMClient, BudgetExceededError
 from rsi_mvp.harness.sandbox import LLMBackendSpec, SandboxExecutor
@@ -197,4 +199,139 @@ def evaluate_suite(
         avg_elapsed_sec=round(avg_elapsed, 4),
         failure_breakdown=dict(failures),
         results=results,
+    )
+
+
+class AnchorGatekeeper:
+    """Anti-collapse / anti-drift gatekeeper verified on a hidden golden Anchor split."""
+
+    def __init__(self, max_anchor_drop: float = 0.03) -> None:
+        self.max_anchor_drop = max_anchor_drop
+
+    def check(
+        self,
+        new_anchor_score: float,
+        baseline_anchor_score: float | None,
+    ) -> tuple[bool, float]:
+        """Return ``(passed, delta)`` comparing ``new_anchor_score`` against baseline."""
+        if baseline_anchor_score is None:
+            return True, 0.0
+        delta = round(new_anchor_score - baseline_anchor_score, 4)
+        passed = delta >= (-self.max_anchor_drop - 1e-9)
+        return passed, delta
+
+
+class TwoStageEvalResult(BaseModel):
+    """Combined outcome of Mini -> Full Dev funnel and optional Anchor Gatekeeper check."""
+
+    dev_mini: SuiteEvalSummary
+    dev_full: SuiteEvalSummary | None = None
+    anchor: SuiteEvalSummary | None = None
+    promoted_to_full: bool = False
+    anchor_passed: bool = True
+    anchor_delta: float = 0.0
+    total_tokens: int = 0
+
+
+def evaluate_with_funnel(
+    dev_mini_tasks: list[TaskSpec],
+    dev_full_tasks: list[TaskSpec],
+    anchor_tasks: list[TaskSpec],
+    solve_fn: SolveFn,
+    llm_client: BaseLLMClient,
+    adapter: TaskAdapter,
+    verifier: Verifier,
+    snapshot_dir: Path,
+    existing_mini_scores: list[float],
+    full_eval_top_k: int = 2,
+    anchor_enabled: bool = True,
+    baseline_anchor_score: float | None = None,
+    max_anchor_drop: float = 0.03,
+    num_samples: int = 1,
+    max_concurrency: int = 4,
+) -> TwoStageEvalResult:
+    """Run two-stage Mini -> Full evaluation funnel followed by Anchor Gatekeeper."""
+    mini_summary = evaluate_suite(
+        tasks=dev_mini_tasks,
+        split_name="dev_mini",
+        solve_fn=solve_fn,
+        llm_client=llm_client,
+        adapter=adapter,
+        verifier=verifier,
+        num_samples=num_samples,
+        max_concurrency=max_concurrency,
+        traces_dir=snapshot_dir / "traces",
+    )
+    (snapshot_dir / "dev_mini_eval.json").write_text(
+        mini_summary.model_dump_json(indent=2), encoding="utf-8"
+    )
+    total_tokens = mini_summary.total_tokens
+
+    # Decide whether candidate promotes to Full Dev evaluation
+    same_set = len(dev_full_tasks) <= len(dev_mini_tasks)
+    if same_set:
+        promoted = True
+        full_summary = mini_summary.model_copy(update={"split": "dev_full"})
+        (snapshot_dir / "dev_full_eval.json").write_text(
+            full_summary.model_dump_json(indent=2), encoding="utf-8"
+        )
+    else:
+        sorted_existing = sorted(existing_mini_scores, reverse=True)
+        if len(sorted_existing) < full_eval_top_k:
+            promoted = True
+        else:
+            cutoff = sorted_existing[full_eval_top_k - 1]
+            promoted = mini_summary.pass_rate >= cutoff - 1e-9
+
+        full_summary = None
+        if promoted:
+            full_summary = evaluate_suite(
+                tasks=dev_full_tasks,
+                split_name="dev_full",
+                solve_fn=solve_fn,
+                llm_client=llm_client,
+                adapter=adapter,
+                verifier=verifier,
+                num_samples=num_samples,
+                max_concurrency=max_concurrency,
+                traces_dir=snapshot_dir / "traces",
+            )
+            (snapshot_dir / "dev_full_eval.json").write_text(
+                full_summary.model_dump_json(indent=2), encoding="utf-8"
+            )
+            total_tokens += full_summary.total_tokens
+
+    anchor_summary: SuiteEvalSummary | None = None
+    anchor_passed = True
+    anchor_delta = 0.0
+    if promoted and anchor_enabled and anchor_tasks:
+        anchor_summary = evaluate_suite(
+            tasks=anchor_tasks,
+            split_name="anchor",
+            solve_fn=solve_fn,
+            llm_client=llm_client,
+            adapter=adapter,
+            verifier=verifier,
+            num_samples=num_samples,
+            max_concurrency=max_concurrency,
+            traces_dir=None,  # Never write anchor traces into agent-visible traces/
+        )
+        (snapshot_dir / "anchor_eval.json").write_text(
+            anchor_summary.model_dump_json(indent=2), encoding="utf-8"
+        )
+        total_tokens += anchor_summary.total_tokens
+        gate = AnchorGatekeeper(max_anchor_drop=max_anchor_drop)
+        anchor_passed, anchor_delta = gate.check(
+            new_anchor_score=anchor_summary.pass_rate,
+            baseline_anchor_score=baseline_anchor_score,
+        )
+
+    return TwoStageEvalResult(
+        dev_mini=mini_summary,
+        dev_full=full_summary,
+        anchor=anchor_summary,
+        promoted_to_full=promoted,
+        anchor_passed=anchor_passed,
+        anchor_delta=anchor_delta,
+        total_tokens=total_tokens,
     )

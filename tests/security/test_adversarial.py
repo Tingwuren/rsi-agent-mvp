@@ -322,3 +322,67 @@ def test_sec_07_live_docker_sandbox_isolation(tmp_path: Path) -> None:
     )
     assert to_res.ok is False
     assert to_res.timed_out is True
+
+
+def test_sec_08_anchor_gatekeeper_rejects_drift_and_collapse(tmp_path: Path) -> None:
+    """SEC-08: Candidate that gains Dev score while dropping Anchor > 3% is blocked."""
+    from rsi_mvp.harness.adapters import get_adapter
+    from rsi_mvp.harness.evaluator import evaluate_with_funnel
+    from rsi_mvp.harness.llm import MockLLMClient
+
+    sandbox = SubprocessSandbox(tmp_root=tmp_path / "tmp")
+    dev_tasks = [
+        TaskSpec(
+            task_id="d1",
+            domain="code",
+            split="dev",
+            prompt="Write f(x).",
+            payload={"entry_file": "solution.py"},
+            ground_truth={"test_code": "from solution import f\ndef test_f(): assert f(1)==2\n"},
+        )
+    ]
+    anchor_tasks = [
+        TaskSpec(
+            task_id="a1",
+            domain="code",
+            split="anchor",
+            prompt="Write g(x).",
+            payload={"entry_file": "solution.py"},
+            ground_truth={"test_code": "from solution import g\ndef test_g(): assert g(2)==4\n"},
+        )
+    ]
+
+    # Simulated overfitted/collapsed candidate: passes Dev (1.0) but fails Anchor (0.0 vs 1.0)
+    def _drifted_solve(task_input: dict[str, object], _client: object) -> dict[str, object]:
+        tid = str(task_input["task_id"])
+        code = "def f(x): return 2\n" if tid == "d1" else "def g(x): return 999\n"
+        return {
+            "task_id": tid,
+            "outputs": [{"raw_text": code, "extracted_answer": code}],
+            "steps": [],
+            "error": None,
+            "total_tokens": 50,
+            "elapsed_sec": 0.01,
+        }
+
+    snap_dir = tmp_path / "cand_drift"
+    snap_dir.mkdir()
+    funnel = evaluate_with_funnel(
+        dev_mini_tasks=dev_tasks,
+        dev_full_tasks=dev_tasks,
+        anchor_tasks=anchor_tasks,
+        solve_fn=_drifted_solve,
+        llm_client=MockLLMClient(),
+        adapter=get_adapter("code"),
+        verifier=GroundTruthCodeVerifier(sandbox=sandbox),
+        snapshot_dir=snap_dir,
+        existing_mini_scores=[0.5],
+        anchor_enabled=True,
+        baseline_anchor_score=1.0,
+        max_anchor_drop=0.03,
+        max_concurrency=1,
+    )
+    assert funnel.dev_full is not None and funnel.dev_full.pass_rate == 1.0
+    assert funnel.anchor is not None and funnel.anchor.pass_rate == 0.0
+    assert funnel.anchor_passed is False
+    assert funnel.anchor_delta == -1.0

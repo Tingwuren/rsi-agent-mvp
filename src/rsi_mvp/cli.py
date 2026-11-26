@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import subprocess
@@ -15,12 +16,14 @@ from rsi_mvp.agent import solve as default_agent_solve
 from rsi_mvp.config import load_dotenv_file, load_experiment_config
 from rsi_mvp.doctor import DoctorReport, run_doctor
 from rsi_mvp.harness.adapters import get_adapter
+from rsi_mvp.harness.archive import ArchiveStore
 from rsi_mvp.harness.data import create_dataset_provider
 from rsi_mvp.harness.evaluator import SolveFn, evaluate_suite, make_sandboxed_solve_fn
 from rsi_mvp.harness.llm import BaseLLMClient, MockLLMClient, OpenAICompatibleClient
+from rsi_mvp.harness.loop import EvolutionOrchestrator
 from rsi_mvp.harness.sandbox import LLMBackendSpec, create_sandbox
 from rsi_mvp.harness.verifiers import get_verifier
-from rsi_mvp.schemas import EvalSplitType, SplitType
+from rsi_mvp.schemas import CandidateRecord, EvalSplitType, SplitType
 
 
 def _format_doctor_report(report: DoctorReport) -> str:
@@ -79,9 +82,9 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     split: SplitType = args.split
     max_samples = args.max_samples
     eval_split_name: EvalSplitType = (
-        "dev_mini" if split == "dev" and max_samples is not None else (
-            "dev_full" if split == "dev" else split
-        )
+        "dev_mini"
+        if split == "dev" and max_samples is not None
+        else ("dev_full" if split == "dev" else split)
     )
     tasks = provider.get_split(
         split=split,
@@ -108,7 +111,9 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         )
 
     if args.snapshot:
-        sandbox = create_sandbox(cfg.sandbox, tmp_root=Path(cfg.experiment.workspace_root) / "tmp")
+        sandbox = create_sandbox(
+            cfg.sandbox, tmp_root=Path(cfg.experiment.workspace_root) / "tmp"
+        )
         if args.mock:
             llm_spec = LLMBackendSpec(mode="mock", mock_responses=["```python\npass\n```"])
         else:
@@ -132,6 +137,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         )
     else:
         solve_fn = default_agent_solve
+
     traces_dir = Path(args.output) / "traces" if args.output else None
 
     summary = evaluate_suite(
@@ -199,12 +205,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     ws = Path(cfg.experiment.workspace_root)
     env.setdefault("HF_HOME", str(ws / "hf_cache"))
     env.setdefault("TMPDIR", str(ws / "tmp"))
+    env.setdefault("XDG_CACHE_HOME", str(ws / "tmp" / "xdg_cache"))
+    env.setdefault("TRITON_CACHE_DIR", str(ws / "tmp" / "triton_cache"))
+    env.setdefault("TORCHINDUCTOR_CACHE_DIR", str(ws / "tmp" / "inductor_cache"))
+    env.setdefault("FLASHINFER_WORKSPACE_DIR", str(ws / "tmp" / "flashinfer_cache"))
     env.setdefault("VLLM_NO_USAGE_STATS", "1")
     env.setdefault("VLLM_CACHE_ROOT", str(ws / "tmp" / "vllm_cache"))
-    env.setdefault("XDG_CACHE_HOME", str(ws / "tmp" / "xdg_cache"))
-    env.setdefault("TRITON_CACHE_DIR", str(ws / "tmp" / "triton"))
-    env.setdefault("VLLM_CACHE_ROOT", str(ws / "tmp" / "vllm_cache"))
-    env.setdefault("FLASHINFER_WORKSPACE_BASE", str(ws / "tmp" / "flashinfer"))
 
     print(f"[SERVE] CUDA_VISIBLE_DEVICES={gpu_ids} {' '.join(cmd)}")
     if args.dry_run:
@@ -212,9 +218,130 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return subprocess.call(cmd, env=env)
 
 
+def _fmt_score(val: float | None) -> str:
+    return f"{val:.1%}" if val is not None else "-"
+
+
+def _format_lineage_table(candidates: list[CandidateRecord]) -> str:
+    header = (
+        f"{'ID':<10} {'Gen':>3} {'Parent':<10} {'Track':<10} {'Status':<22} "
+        f"{'Mini':>6} {'Full':>6} {'Anchor':>6} {'Holdout':>7} {'Tokens':>8}  Hypothesis"
+    )
+    lines = [header, "-" * len(header)]
+    for c in candidates:
+        hyp = (c.hypothesis[:44] + "...") if len(c.hypothesis) > 47 else c.hypothesis
+        lines.append(
+            f"{c.candidate_id:<10} {c.generation:>3} {(c.parent_id or '-'):<10} "
+            f"{c.track:<10} {c.status:<22} {_fmt_score(c.dev_mini_score):>6} "
+            f"{_fmt_score(c.dev_full_score):>6} {_fmt_score(c.anchor_score):>6} "
+            f"{_fmt_score(c.holdout_score):>7} {c.total_tokens:>8}  {hyp}"
+        )
+    return "\n".join(lines)
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    dotenv = Path(".env")
+    if dotenv.is_file():
+        load_dotenv_file(dotenv)
+
+    run_dir: Path | None = Path(args.resume) if args.resume else None
+    if run_dir is not None:
+        cfg_path = run_dir / "config.yaml"
+        if not cfg_path.is_file():
+            raise FileNotFoundError(f"Resume directory missing config.yaml: {cfg_path}")
+        cfg = load_experiment_config(cfg_path)
+    else:
+        if not args.config:
+            print("Error: --config is required unless --resume is provided.", file=sys.stderr)
+            return 2
+        cfg = load_experiment_config(Path(args.config))
+
+    orch = EvolutionOrchestrator(
+        config=cfg,
+        run_dir=run_dir,
+        enforce_storage_guard=not args.skip_storage_guard,
+    )
+    candidates = orch.run(max_generations=args.max_generations)
+    print(f"[RUN] Completed in {orch.run_dir}")
+    print(_format_lineage_table(candidates))
+    return 0
+
+
+def _cmd_inspect(args: argparse.Namespace) -> int:
+    store = ArchiveStore(Path(args.run))
+    candidates = store.list_candidates()
+    if args.json:
+        print(json.dumps([c.model_dump() for c in candidates], indent=2, ensure_ascii=False))
+    else:
+        print(f"Run directory: {args.run}")
+        print(_format_lineage_table(candidates))
+        best = store.best_candidate()
+        if best is not None:
+            print(
+                f"\nBest accepted: {best.candidate_id} (gen {best.generation}) | "
+                f"dev_full={_fmt_score(best.dev_full_score)} | "
+                f"anchor={_fmt_score(best.anchor_score)} | "
+                f"holdout={_fmt_score(best.holdout_score)}"
+            )
+    return 0
+
+
+def _cmd_diff(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run)
+    store = ArchiveStore(run_dir)
+    cand_a = store.get_candidate(args.cand_a)
+    cand_b = store.get_candidate(args.cand_b)
+    if cand_a is None or cand_b is None:
+        missing = args.cand_a if cand_a is None else args.cand_b
+        print(f"Candidate not found in {run_dir}: {missing}", file=sys.stderr)
+        return 1
+
+    dir_a = run_dir / cand_a.snapshot_dir / "agent"
+    dir_b = run_dir / cand_b.snapshot_dir / "agent"
+    files_a = (
+        {p.relative_to(dir_a).as_posix() for p in dir_a.rglob("*.py")}
+        if dir_a.is_dir()
+        else set()
+    )
+    files_b = (
+        {p.relative_to(dir_b).as_posix() for p in dir_b.rglob("*.py")}
+        if dir_b.is_dir()
+        else set()
+    )
+
+    print(
+        f"Comparing {cand_a.candidate_id} (dev={_fmt_score(cand_a.dev_full_score)}, "
+        f"holdout={_fmt_score(cand_a.holdout_score)}) -> "
+        f"{cand_b.candidate_id} (dev={_fmt_score(cand_b.dev_full_score)}, "
+        f"holdout={_fmt_score(cand_b.holdout_score)})\n"
+    )
+    diff_chunks: list[str] = []
+    for rel in sorted(files_a | files_b):
+        text_a = (
+            (dir_a / rel).read_text(encoding="utf-8").splitlines(keepends=True)
+            if rel in files_a
+            else []
+        )
+        text_b = (
+            (dir_b / rel).read_text(encoding="utf-8").splitlines(keepends=True)
+            if rel in files_b
+            else []
+        )
+        diff_chunks.extend(
+            difflib.unified_diff(
+                text_a,
+                text_b,
+                fromfile=f"{cand_a.candidate_id}/agent/{rel}",
+                tofile=f"{cand_b.candidate_id}/agent/{rel}",
+            )
+        )
+    print("".join(diff_chunks) or "(No Python code differences)")
+    return 0
+
+
 def _cmd_not_implemented(args: argparse.Namespace) -> int:
     print(
-        f"Command 'rsi {args.command}' is registered in the CLI contract and scheduled for M3–M5.",
+        f"Command 'rsi {args.command}' is registered in the CLI contract and scheduled for M4–M5.",
         file=sys.stderr,
     )
     return 2
@@ -262,11 +389,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--dry-run", action="store_true", help="Print command without starting")
     p_serve.set_defaults(func=_cmd_serve)
 
+    p_run = subparsers.add_parser("run", help="Run or resume an RSI evolution experiment")
+    p_run.add_argument("--config", type=str, default=None, help="Experiment YAML config path")
+    p_run.add_argument("--resume", type=str, default=None, help="Existing run directory to resume")
+    p_run.add_argument("--max-generations", type=int, default=None, help="Override max generations")
+    p_run.add_argument("--skip-storage-guard", action="store_true", help="Skip disk free guard")
+    p_run.set_defaults(func=_cmd_run)
+
+    p_inspect = subparsers.add_parser("inspect", help="Inspect experiment lineage archive")
+    p_inspect.add_argument("--run", type=str, required=True, help="Run directory path")
+    p_inspect.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    p_inspect.set_defaults(func=_cmd_inspect)
+
+    p_diff = subparsers.add_parser("diff", help="Show code diff between two candidates")
+    p_diff.add_argument("--run", type=str, required=True, help="Run directory path")
+    p_diff.add_argument("cand_a", type=str, help="First candidate ID (e.g. cand_0000)")
+    p_diff.add_argument("cand_b", type=str, help="Second candidate ID (e.g. cand_0002)")
+    p_diff.set_defaults(func=_cmd_diff)
+
     for cmd_name, help_text in [
-        ("run", "Run or resume an RSI evolution experiment (M3)"),
         ("train-lora", "Run a single-GPU LoRA fine-tuning round from traces (M4)"),
-        ("inspect", "Inspect experiment lineage archive and metrics (M3/M5)"),
-        ("diff", "Show unified code diff between two candidates (M5)"),
         ("report", "Generate Markdown summary report for a run (M5)"),
     ]:
         p = subparsers.add_parser(cmd_name, help=help_text)

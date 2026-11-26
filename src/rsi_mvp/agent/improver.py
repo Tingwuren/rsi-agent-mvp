@@ -54,7 +54,7 @@ def propose_improvement(context: dict[str, Any], llm_client: Any) -> dict[str, A
     ]
     resp = llm_client.chat(
         messages=messages,
-        temperature=0.3,
+        temperature=0.6,
         max_tokens=3072,
         response_format={"type": "json_object"},
     )
