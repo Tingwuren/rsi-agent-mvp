@@ -22,6 +22,7 @@ from rsi_mvp.harness.evaluator import SolveFn, evaluate_suite, make_sandboxed_so
 from rsi_mvp.harness.lifecycle import VLLMLifecycleManager
 from rsi_mvp.harness.llm import BaseLLMClient, MockLLMClient, OpenAICompatibleClient
 from rsi_mvp.harness.loop import EvolutionOrchestrator
+from rsi_mvp.harness.reporter import generate_summary_report
 from rsi_mvp.harness.sandbox import LLMBackendSpec, create_sandbox
 from rsi_mvp.harness.trainer import MockTrainerBackend, TRLLoRASFTTrainer
 from rsi_mvp.harness.verifiers import get_verifier
@@ -385,12 +386,14 @@ def _cmd_train_lora(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_not_implemented(args: argparse.Namespace) -> int:
-    print(
-        f"Command 'rsi {args.command}' is registered in the CLI contract and scheduled for M5.",
-        file=sys.stderr,
-    )
-    return 2
+def _cmd_report(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run)
+    report_md = generate_summary_report(run_dir, write_file=True)
+    if args.stdout:
+        print(report_md)
+    else:
+        print(f"[REPORT] Wrote {run_dir / 'summary.md'}")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -465,8 +468,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--mock", action="store_true", help="Use zero-GPU MockTrainerBackend")
     p_train.set_defaults(func=_cmd_train_lora)
 
-    p_report = subparsers.add_parser("report", help="Generate Markdown summary report (M5)")
-    p_report.set_defaults(func=_cmd_not_implemented)
+    p_report = subparsers.add_parser("report", help="Generate Markdown summary report (summary.md)")
+    p_report.add_argument("--run", type=str, required=True, help="Run directory path")
+    p_report.add_argument("--stdout", action="store_true", help="Also print report to stdout")
+    p_report.set_defaults(func=_cmd_report)
 
     return parser
 

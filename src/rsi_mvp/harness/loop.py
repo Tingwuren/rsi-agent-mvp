@@ -33,9 +33,16 @@ from rsi_mvp.harness.evaluator import (
 from rsi_mvp.harness.lifecycle import ModelLifecycleManager
 from rsi_mvp.harness.llm import BaseLLMClient, BudgetExceededError, MockLLMClient
 from rsi_mvp.harness.patcher import apply_and_verify_patch, run_dual_entry_smoke_test
+from rsi_mvp.harness.reporter import generate_summary_report
 from rsi_mvp.harness.sandbox import LLMBackendSpec, SandboxExecutor, create_sandbox
 from rsi_mvp.harness.trainer import TrainerBackend, export_sft_dataset
-from rsi_mvp.harness.verifiers import GroundTruthCodeVerifier, Verifier, get_verifier
+from rsi_mvp.harness.verifiers import (
+    CodeTestCoVerifier,
+    GroundTruthCodeVerifier,
+    GroundTruthMathVerifier,
+    Verifier,
+    get_verifier,
+)
 from rsi_mvp.schemas import (
     CandidateRecord,
     CandidateStatus,
@@ -174,8 +181,23 @@ class EvolutionOrchestrator:
             self.verifier = verifier
         elif config.task.verifier == "ground_truth_code":
             self.verifier = GroundTruthCodeVerifier(sandbox=self.sandbox)
+        elif config.task.verifier == "code_test_co":
+            self.verifier = CodeTestCoVerifier(sandbox=self.sandbox)
         else:
             self.verifier = get_verifier(config.task.verifier)
+
+        # Ground-truth verifier used for golden Anchor & Holdout even during label-free RSI
+        if self.verifier.is_label_free:
+            if config.task.adapter == "code":
+                self.ground_truth_verifier: Verifier = GroundTruthCodeVerifier(
+                    sandbox=self.sandbox
+                )
+            elif config.task.adapter == "math":
+                self.ground_truth_verifier = GroundTruthMathVerifier()
+            else:
+                self.ground_truth_verifier = self.verifier
+        else:
+            self.ground_truth_verifier = self.verifier
 
         self.policy: SelectionPolicy = policy or create_selection_policy(
             config.evolution.selection_policy
@@ -309,6 +331,9 @@ class EvolutionOrchestrator:
         total_tokens = dev_summary.total_tokens
 
         anchor_score: float | None = None
+        gt_samples = 1 if not self.ground_truth_verifier.is_label_free else (
+            self.config.task.num_samples_per_task
+        )
         if self.config.guardrails.anchor_enabled and self.anchor_tasks:
             anchor_summary = evaluate_suite(
                 tasks=self.anchor_tasks,
@@ -316,8 +341,8 @@ class EvolutionOrchestrator:
                 solve_fn=solve_fn,
                 llm_client=llm_client,
                 adapter=self.adapter,
-                verifier=self.verifier,
-                num_samples=self.config.task.num_samples_per_task,
+                verifier=self.ground_truth_verifier,
+                num_samples=gt_samples,
                 max_concurrency=self.config.dataset.max_concurrency,
                 traces_dir=None,
             )
@@ -335,8 +360,8 @@ class EvolutionOrchestrator:
                 solve_fn=solve_fn,
                 llm_client=llm_client,
                 adapter=self.adapter,
-                verifier=self.verifier,
-                num_samples=self.config.task.num_samples_per_task,
+                verifier=self.ground_truth_verifier,
+                num_samples=gt_samples,
                 max_concurrency=self.config.dataset.max_concurrency,
                 traces_dir=None,
             )
@@ -357,6 +382,7 @@ class EvolutionOrchestrator:
             dev_full_score=dev_summary.pass_rate,
             anchor_score=anchor_score,
             holdout_score=holdout_score,
+            output_entropy=dev_summary.output_entropy,
             total_tokens=total_tokens,
         )
         self.archive.add_candidate(rec)
@@ -499,6 +525,7 @@ class EvolutionOrchestrator:
             existing_mini_scores=existing_mini_scores,
             full_eval_top_k=self.config.dataset.full_eval_top_k,
             anchor_enabled=self.config.guardrails.anchor_enabled,
+            anchor_verifier=self.ground_truth_verifier,
             baseline_anchor_score=self._baseline_anchor_score(),
             max_anchor_drop=self.config.guardrails.max_anchor_drop,
             num_samples=self.config.task.num_samples_per_task,
@@ -544,14 +571,17 @@ class EvolutionOrchestrator:
             or generation == self.config.evolution.max_generations
         )
         if self.holdout_tasks and status == "accepted" and (is_new_best or is_periodic):
+            gt_samples = 1 if not self.ground_truth_verifier.is_label_free else (
+                self.config.task.num_samples_per_task
+            )
             ho_summary = evaluate_suite(
                 tasks=self.holdout_tasks,
                 split_name="holdout",
                 solve_fn=solve_fn,
                 llm_client=llm_client,
                 adapter=self.adapter,
-                verifier=self.verifier,
-                num_samples=self.config.task.num_samples_per_task,
+                verifier=self.ground_truth_verifier,
+                num_samples=gt_samples,
                 max_concurrency=self.config.dataset.max_concurrency,
                 traces_dir=None,
             )
@@ -574,6 +604,11 @@ class EvolutionOrchestrator:
             dev_full_score=dev_full_score,
             anchor_score=anchor_score,
             holdout_score=holdout_score,
+            output_entropy=(
+                funnel.dev_full.output_entropy
+                if funnel.dev_full is not None
+                else funnel.dev_mini.output_entropy
+            ),
             total_tokens=total_tokens,
             failure_reason=failure_reason,
         )
@@ -695,6 +730,9 @@ class EvolutionOrchestrator:
         anchor_score: float | None = None
         anchor_passed = True
         anchor_delta = 0.0
+        gt_samples = 1 if not self.ground_truth_verifier.is_label_free else (
+            self.config.task.num_samples_per_task
+        )
         if self.config.guardrails.anchor_enabled and self.anchor_tasks:
             anchor_summary = evaluate_suite(
                 tasks=self.anchor_tasks,
@@ -702,8 +740,8 @@ class EvolutionOrchestrator:
                 solve_fn=eval_solve_fn,
                 llm_client=eval_client,
                 adapter=self.adapter,
-                verifier=self.verifier,
-                num_samples=self.config.task.num_samples_per_task,
+                verifier=self.ground_truth_verifier,
+                num_samples=gt_samples,
                 max_concurrency=self.config.dataset.max_concurrency,
                 traces_dir=None,
             )
@@ -746,8 +784,8 @@ class EvolutionOrchestrator:
                     solve_fn=eval_solve_fn,
                     llm_client=eval_client,
                     adapter=self.adapter,
-                    verifier=self.verifier,
-                    num_samples=self.config.task.num_samples_per_task,
+                    verifier=self.ground_truth_verifier,
+                    num_samples=gt_samples,
                     max_concurrency=self.config.dataset.max_concurrency,
                     traces_dir=None,
                 )
@@ -879,4 +917,5 @@ class EvolutionOrchestrator:
                     best_score = candidate_primary_score(lora_cand)
                     no_improve_streak = 0
 
+        generate_summary_report(self.run_dir, write_file=True)
         return self.archive.list_candidates()

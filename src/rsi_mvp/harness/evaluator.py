@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from rsi_mvp.harness.adapters import TaskAdapter
 from rsi_mvp.harness.llm import BaseLLMClient, BudgetExceededError
 from rsi_mvp.harness.sandbox import LLMBackendSpec, SandboxExecutor
-from rsi_mvp.harness.verifiers import Verifier
+from rsi_mvp.harness.verifiers import Verifier, compute_shannon_entropy
 from rsi_mvp.schemas import (
     CandidateOutput,
     EvalSplitType,
@@ -162,9 +162,15 @@ def evaluate_suite(
                 ordered_results[task_id] = fut.result()
 
     results: list[VerifyResult] = []
+    entropies: list[float] = []
     for spec in tasks:
         sol, res = ordered_results[spec.task_id]
         results.append(res)
+        if len(sol.outputs) > 1:
+            ans_counts = Counter(
+                (o.extracted_answer or o.raw_text).strip() for o in sol.outputs
+            )
+            entropies.append(compute_shannon_entropy(list(ans_counts.values())))
         if traces_dir is not None:
             trace_payload = {
                 "task_id": spec.task_id,
@@ -183,6 +189,7 @@ def evaluate_suite(
     mean_score = sum(r.score for r in results) / total_tasks
     pass_rate = passed_tasks / total_tasks
     avg_confidence = sum(r.confidence for r in results) / total_tasks
+    output_entropy = round(sum(entropies) / len(entropies), 4) if entropies else None
     total_tokens = sum(r.tokens_used for r in results)
     avg_elapsed = sum(r.elapsed_sec for r in results) / total_tasks
     failures: Counter[str] = Counter(r.failure_type for r in results if r.failure_type != "none")
@@ -193,6 +200,7 @@ def evaluate_suite(
         mean_score=round(mean_score, 4),
         pass_rate=round(pass_rate, 4),
         avg_confidence=round(avg_confidence, 4),
+        output_entropy=output_entropy,
         total_tasks=total_tasks,
         passed_tasks=passed_tasks,
         total_tokens=total_tokens,
@@ -245,6 +253,7 @@ def evaluate_with_funnel(
     existing_mini_scores: list[float],
     full_eval_top_k: int = 2,
     anchor_enabled: bool = True,
+    anchor_verifier: Verifier | None = None,
     baseline_anchor_score: float | None = None,
     max_anchor_drop: float = 0.03,
     num_samples: int = 1,
@@ -305,14 +314,16 @@ def evaluate_with_funnel(
     anchor_passed = True
     anchor_delta = 0.0
     if promoted and anchor_enabled and anchor_tasks:
+        eff_anchor_verifier = anchor_verifier or verifier
+        anchor_num_samples = 1 if not eff_anchor_verifier.is_label_free else num_samples
         anchor_summary = evaluate_suite(
             tasks=anchor_tasks,
             split_name="anchor",
             solve_fn=solve_fn,
             llm_client=llm_client,
             adapter=adapter,
-            verifier=verifier,
-            num_samples=num_samples,
+            verifier=eff_anchor_verifier,
+            num_samples=anchor_num_samples,
             max_concurrency=max_concurrency,
             traces_dir=None,  # Never write anchor traces into agent-visible traces/
         )

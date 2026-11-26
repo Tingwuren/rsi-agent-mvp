@@ -1,0 +1,65 @@
+experiment:
+  name: "qwen3_8b_math500_labelfree_consensus"
+  seed: 42
+  workspace_root: "${RSI_WORKSPACE_ROOT:-/mnt/data0/Projects/rsi-agent-mvp/.workspace}"
+  output_dir: "${RSI_WORKSPACE_ROOT:-/mnt/data0/Projects/rsi-agent-mvp/.workspace}/runs"
+
+hardware:
+  mode: "single_gpu_timeshare"
+  serving_gpus: [1]
+  training_gpus: [1]
+
+model:
+  base_model: "Qwen/Qwen3-8B"
+  vllm_host: "127.0.0.1"
+  vllm_port: 8000
+  api_key_env: "RSI_LLM_API_KEY"
+  base_url_env: "RSI_LLM_BASE_URL"
+  max_model_len: 16384
+  enable_lora: true
+  temperature: 0.7
+
+task:
+  adapter: "math"
+  verifier: "consensus"                 # Label-free K-sample majority vote on Train/Dev
+  num_samples_per_task: 8               # K=8 independent samples per unlabeled prompt
+
+dataset:
+  provider: "jsonl"
+  path: "${RSI_WORKSPACE_ROOT:-/mnt/data0/Projects/rsi-agent-mvp/.workspace}/datasets/math_500"
+  mini_eval_size: 24
+  full_eval_top_k: 2
+  max_concurrency: 4
+
+evolution:
+  max_generations: 6
+  selection_policy: "evolutionary_archive"
+  holdout_eval_interval: 3
+  early_stop_patience: 4
+  max_files_per_mutation: 3
+  max_failed_traces_in_context: 4
+
+weight_adaptation:
+  enabled: true
+  trigger_every_n_generations: 3
+  method: "sft_lora"
+  min_train_samples: 30
+  min_confidence: 0.75                  # Require >= 6/8 consensus before distilling into LoRA
+  lora_r: 16
+  lora_alpha: 32
+  learning_rate: 1.0e-4
+  num_epochs: 2
+  replay_ratio: 0.25                    # Mix 25% replay buffer to mitigate Model Collapse
+
+guardrails:
+  anchor_enabled: true                  # Mandatory golden Anchor Gatekeeper (ground-truth math)
+  max_anchor_drop: 0.03
+  max_total_tokens: 3000000
+  min_free_disk_gb: 5.0
+
+sandbox:
+  backend: "subprocess"
+  docker_image: "rsi-sandbox:py311"
+  task_timeout_sec: 45
+  improve_timeout_sec: 120
+  memory_limit: "1g"
