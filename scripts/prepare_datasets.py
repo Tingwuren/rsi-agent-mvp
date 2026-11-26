@@ -168,6 +168,48 @@ def prepare_math_500(out_dir: Path, seed: int = 42, max_total: int = 240) -> Non
     _write_splits(out_dir, split_specs)
 
 
+def prepare_bigcodebench(out_dir: Path, seed: int = 42, max_total: int = 280) -> None:
+    """Prepare a stratified 280-task BigCodeBench-Instruct subset (120/60/60/40)."""
+    from datasets import load_dataset
+
+    ds = load_dataset("bigcode/bigcodebench", split="v0.1.2")
+    raw_items: list[dict[str, Any]] = []
+    for row in ds:
+        task_id = str(row["task_id"]).replace("/", "_")
+        prompt = str(row.get("instruct_prompt") or row.get("complete_prompt") or "").strip()
+        libs = row.get("libs") or []
+        category = str(libs[0]).lower() if isinstance(libs, list) and libs else "stdlib"
+        test_code = "from solution import *\n" + str(row["test"])
+        raw_items.append(
+            {
+                "task_id": task_id,
+                "domain": "code",
+                "category": category,
+                "prompt": prompt,
+                "payload": {
+                    "entry_file": "solution.py",
+                    "entry_point": str(row.get("entry_point", "task_func")),
+                    "libs": libs,
+                },
+                "ground_truth": {"test_code": test_code},
+                "timeout_sec": 25,
+            }
+        )
+
+    cap = min(max_total, len(raw_items))
+    counts: dict[SplitType, int] = {
+        "anchor": min(40, cap // 7),
+        "holdout": min(60, cap // 4),
+        "dev": min(60, cap // 4),
+        "train": max(0, cap - min(40, cap // 7) - min(60, cap // 4) - min(60, cap // 4)),
+    }
+    part = _stratified_partition(raw_items, counts=counts, seed=seed)
+    split_specs: dict[SplitType, list[TaskSpec]] = {
+        s: [TaskSpec(split=s, **item) for item in rows] for s, rows in part.items()
+    }
+    _write_splits(out_dir, split_specs)
+
+
 def prepare_synthetic(workspace_root: Path) -> None:
     """Create tiny offline synthetic code + math suites for instant local verification."""
     code_items = [
@@ -239,7 +281,7 @@ def main() -> int:
     parser.add_argument(
         "--dataset",
         required=True,
-        choices=["mbpp_plus", "math_500", "synthetic", "all"],
+        choices=["mbpp_plus", "math_500", "bigcodebench", "synthetic", "all"],
     )
     parser.add_argument(
         "--workspace-root",
@@ -260,6 +302,8 @@ def main() -> int:
         prepare_mbpp_plus(ws / "datasets" / "mbpp_plus", seed=args.seed)
     if args.dataset in ("math_500", "all"):
         prepare_math_500(ws / "datasets" / "math_500", seed=args.seed)
+    if args.dataset == "bigcodebench":
+        prepare_bigcodebench(ws / "datasets" / "bigcodebench_280", seed=args.seed)
     return 0
 
 

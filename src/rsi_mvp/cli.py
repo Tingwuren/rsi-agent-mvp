@@ -19,9 +19,11 @@ from rsi_mvp.harness.adapters import get_adapter
 from rsi_mvp.harness.archive import ArchiveStore
 from rsi_mvp.harness.data import create_dataset_provider
 from rsi_mvp.harness.evaluator import SolveFn, evaluate_suite, make_sandboxed_solve_fn
+from rsi_mvp.harness.lifecycle import VLLMLifecycleManager
 from rsi_mvp.harness.llm import BaseLLMClient, MockLLMClient, OpenAICompatibleClient
 from rsi_mvp.harness.loop import EvolutionOrchestrator
 from rsi_mvp.harness.sandbox import LLMBackendSpec, create_sandbox
+from rsi_mvp.harness.trainer import MockTrainerBackend, TRLLoRASFTTrainer
 from rsi_mvp.harness.verifiers import get_verifier
 from rsi_mvp.schemas import CandidateRecord, EvalSplitType, SplitType
 
@@ -256,12 +258,28 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return 2
         cfg = load_experiment_config(Path(args.config))
 
+    lifecycle = None
+    trainer = None
+    if cfg.weight_adaptation.enabled:
+        lifecycle = VLLMLifecycleManager(
+            config=cfg,
+            model_path_override=args.model,
+            log_dir=(run_dir or Path(cfg.experiment.output_dir)),
+        )
+        trainer = TRLLoRASFTTrainer(workspace_root=Path(cfg.experiment.workspace_root))
+
     orch = EvolutionOrchestrator(
         config=cfg,
         run_dir=run_dir,
+        lifecycle=lifecycle,
+        trainer=trainer,
         enforce_storage_guard=not args.skip_storage_guard,
     )
-    candidates = orch.run(max_generations=args.max_generations)
+    try:
+        candidates = orch.run(max_generations=args.max_generations)
+    finally:
+        if lifecycle is not None:
+            lifecycle.shutdown()
     print(f"[RUN] Completed in {orch.run_dir}")
     print(_format_lineage_table(candidates))
     return 0
@@ -339,9 +357,37 @@ def _cmd_diff(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_train_lora(args: argparse.Namespace) -> int:
+    dotenv = Path(".env")
+    if dotenv.is_file():
+        load_dotenv_file(dotenv)
+
+    cfg = load_experiment_config(Path(args.config))
+    ws = Path(cfg.experiment.workspace_root)
+    output_dir = Path(args.output) if args.output else (ws / "adapters" / args.adapter_id)
+    trainer = (
+        MockTrainerBackend()
+        if args.mock
+        else TRLLoRASFTTrainer(workspace_root=ws, max_length=args.max_length)
+    )
+    model_ref = args.model or cfg.model.base_model
+    rec = trainer.train_lora(
+        adapter_id=args.adapter_id,
+        base_model=model_ref,
+        parent_adapter_path=args.parent_adapter,
+        train_jsonl=Path(args.train_jsonl),
+        output_dir=output_dir,
+        gpu_ids=cfg.hardware.training_gpus,
+        config=cfg.weight_adaptation,
+        seed=cfg.experiment.seed,
+    )
+    print(rec.model_dump_json(indent=2))
+    return 0
+
+
 def _cmd_not_implemented(args: argparse.Namespace) -> int:
     print(
-        f"Command 'rsi {args.command}' is registered in the CLI contract and scheduled for M4–M5.",
+        f"Command 'rsi {args.command}' is registered in the CLI contract and scheduled for M5.",
         file=sys.stderr,
     )
     return 2
@@ -392,6 +438,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = subparsers.add_parser("run", help="Run or resume an RSI evolution experiment")
     p_run.add_argument("--config", type=str, default=None, help="Experiment YAML config path")
     p_run.add_argument("--resume", type=str, default=None, help="Existing run directory to resume")
+    p_run.add_argument("--model", type=str, default=None, help="Override local model path")
     p_run.add_argument("--max-generations", type=int, default=None, help="Override max generations")
     p_run.add_argument("--skip-storage-guard", action="store_true", help="Skip disk free guard")
     p_run.set_defaults(func=_cmd_run)
@@ -407,12 +454,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("cand_b", type=str, help="Second candidate ID (e.g. cand_0002)")
     p_diff.set_defaults(func=_cmd_diff)
 
-    for cmd_name, help_text in [
-        ("train-lora", "Run a single-GPU LoRA fine-tuning round from traces (M4)"),
-        ("report", "Generate Markdown summary report for a run (M5)"),
-    ]:
-        p = subparsers.add_parser(cmd_name, help=help_text)
-        p.set_defaults(func=_cmd_not_implemented)
+    p_train = subparsers.add_parser("train-lora", help="Run a single-GPU LoRA SFT fine-tuning job")
+    p_train.add_argument("--config", type=str, required=True, help="Experiment YAML config path")
+    p_train.add_argument("--train-jsonl", type=str, required=True, help="Messages SFT JSONL path")
+    p_train.add_argument("--adapter-id", type=str, default="lora_manual", help="Output adapter ID")
+    p_train.add_argument("--model", type=str, default=None, help="Override local base model path")
+    p_train.add_argument("--parent-adapter", type=str, default=None, help="Optional parent LoRA")
+    p_train.add_argument("--output", type=str, default=None, help="Output adapter directory")
+    p_train.add_argument("--max-length", type=int, default=4096, help="Max SFT sequence length")
+    p_train.add_argument("--mock", action="store_true", help="Use zero-GPU MockTrainerBackend")
+    p_train.set_defaults(func=_cmd_train_lora)
+
+    p_report = subparsers.add_parser("report", help="Generate Markdown summary report (M5)")
+    p_report.set_defaults(func=_cmd_not_implemented)
 
     return parser
 

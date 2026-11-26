@@ -23,22 +23,29 @@ from rsi_mvp.harness.archive import (
 )
 from rsi_mvp.harness.data import DatasetProvider, create_dataset_provider
 from rsi_mvp.harness.evaluator import (
+    AnchorGatekeeper,
     SolveFn,
+    evaluate_single_task,
     evaluate_suite,
     evaluate_with_funnel,
     make_sandboxed_solve_fn,
 )
+from rsi_mvp.harness.lifecycle import ModelLifecycleManager
 from rsi_mvp.harness.llm import BaseLLMClient, BudgetExceededError, MockLLMClient
 from rsi_mvp.harness.patcher import apply_and_verify_patch, run_dual_entry_smoke_test
 from rsi_mvp.harness.sandbox import LLMBackendSpec, SandboxExecutor, create_sandbox
+from rsi_mvp.harness.trainer import TrainerBackend, export_sft_dataset
 from rsi_mvp.harness.verifiers import GroundTruthCodeVerifier, Verifier, get_verifier
 from rsi_mvp.schemas import (
     CandidateRecord,
     CandidateStatus,
     ExperimentConfig,
+    LoRAAdapterRecord,
     MutationProposal,
     SuiteEvalSummary,
+    TaskSolution,
     TaskSpec,
+    VerifyResult,
 )
 
 _DEFAULT_SEED_AGENT_DIR = Path(__file__).resolve().parent.parent / "agent"
@@ -125,6 +132,9 @@ class EvolutionOrchestrator:
         policy: SelectionPolicy | None = None,
         solve_factory: SolveFactory | None = None,
         improve_spec_factory: ImproveSpecFactory | None = None,
+        lifecycle: ModelLifecycleManager | None = None,
+        trainer: TrainerBackend | None = None,
+        replay_jsonl: Path | None = None,
         enforce_storage_guard: bool = True,
     ) -> None:
         self.config = config
@@ -172,10 +182,20 @@ class EvolutionOrchestrator:
         )
         self._solve_factory = solve_factory
         self._improve_spec_factory = improve_spec_factory
+        self.lifecycle = lifecycle
+        self.trainer = trainer
+        self.replay_jsonl = replay_jsonl
         self._rng = random.Random(config.experiment.seed)
+
+        # Restore latest accepted LoRA adapter on resume
+        accepted_loras = [a for a in self.archive.list_lora_adapters() if a.accepted]
+        self._active_lora: LoRAAdapterRecord | None = (
+            accepted_loras[-1] if accepted_loras else None
+        )
 
         # Pre-load deterministic splits
         seed = config.experiment.seed
+        self.train_tasks = _safe_load_split(self.provider, "train", seed=seed)
         self.dev_full_tasks = self.provider.get_split("dev", stratified=True, seed=seed)
         self.dev_mini_tasks = self.provider.get_split(
             "dev",
@@ -192,7 +212,18 @@ class EvolutionOrchestrator:
             else []
         )
 
+    @property
+    def active_lora(self) -> LoRAAdapterRecord | None:
+        return self._active_lora
+
     def _default_llm_spec(self, active_lora: str | None = None) -> LLMBackendSpec:
+        if self.lifecycle is not None:
+            lora_obj = (
+                self._active_lora
+                if (self._active_lora and self._active_lora.adapter_id == active_lora)
+                else None
+            )
+            return self.lifecycle.ensure_serving(active_lora=lora_obj)
         base_url = os.environ.get(
             self.config.model.base_url_env,
             f"http://{self.config.model.vllm_host}:{self.config.model.vllm_port}/v1",
@@ -549,6 +580,227 @@ class EvolutionOrchestrator:
         self.archive.add_candidate(rec)
         return rec
 
+    def _run_weight_adaptation_round(self, generation: int) -> CandidateRecord | None:
+        """Track B: collect verified Train trajectories, fine-tune LoRA, gate on Anchor."""
+        wa_cfg = self.config.weight_adaptation
+        if not wa_cfg.enabled or self.trainer is None or self.lifecycle is None:
+            return None
+        if not self.train_tasks:
+            self.archive.record_event("lora_skipped_no_train_split", {"generation": generation})
+            return None
+
+        best_parent = self.archive.best_candidate()
+        if best_parent is None:
+            return None
+
+        parent_snap = self.run_dir / best_parent.snapshot_dir
+        prev_lora = self._active_lora
+        solve_fn, llm_client = self._build_solve_runner(
+            generation=generation,
+            snapshot_dir=parent_snap,
+            active_lora=prev_lora.adapter_id if prev_lora else None,
+        )
+
+        # 1. Collect verified Train trajectories using the best scaffold
+        evaluated_train: list[tuple[TaskSpec, TaskSolution, VerifyResult]] = []
+        for spec in self.train_tasks:
+            sol, ver = evaluate_single_task(
+                spec=spec,
+                solve_fn=solve_fn,
+                llm_client=llm_client,
+                adapter=self.adapter,
+                verifier=self.verifier,
+                num_samples=self.config.task.num_samples_per_task,
+            )
+            evaluated_train.append((spec, sol, ver))
+
+        sft_jsonl = self.run_dir / "sft_data" / f"gen_{generation:04d}.jsonl"
+        n_exported = export_sft_dataset(
+            evaluated_items=evaluated_train,
+            adapter=self.adapter,
+            output_jsonl=sft_jsonl,
+            min_confidence=wa_cfg.min_confidence,
+            replay_jsonl=self.replay_jsonl,
+            replay_ratio=wa_cfg.replay_ratio,
+            seed=self.config.experiment.seed + generation,
+        )
+        if n_exported < wa_cfg.min_train_samples:
+            self.archive.record_event(
+                "lora_skipped_insufficient_samples",
+                {
+                    "generation": generation,
+                    "exported": n_exported,
+                    "required": wa_cfg.min_train_samples,
+                },
+            )
+            return None
+
+        # 2. Acquire GPU(s) (in single-GPU mode this cleanly stops vLLM & waits for VRAM free)
+        gpu_ids = self.lifecycle.acquire_for_training()
+        adapter_idx = len(self.archive.list_lora_adapters()) + 1
+        adapter_id = f"lora_{adapter_idx:04d}"
+        adapter_dir = (
+            Path(self.config.experiment.workspace_root)
+            / "adapters"
+            / self.config.experiment.name
+            / adapter_id
+        )
+
+        lora_rec = self.trainer.train_lora(
+            adapter_id=adapter_id,
+            base_model=self.config.model.base_model,
+            parent_adapter_path=prev_lora.adapter_path if prev_lora else None,
+            train_jsonl=sft_jsonl,
+            output_dir=adapter_dir,
+            gpu_ids=gpu_ids,
+            config=wa_cfg,
+            seed=self.config.experiment.seed + generation,
+        )
+
+        # 3. Release GPU & hot-load / restart vLLM with the new candidate LoRA
+        self.lifecycle.release_after_training(new_lora=lora_rec)
+
+        cand_id = self.archive.next_candidate_id()
+        cand_snap = self.snapshots_dir / cand_id
+        if (cand_snap / "agent").exists():
+            shutil.rmtree(cand_snap / "agent")
+        cand_snap.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(parent_snap / "agent", cand_snap / "agent")
+        rel_snap = f"snapshots/{cand_id}"
+
+        # Temporarily point active_lora to candidate LoRA during validation
+        self._active_lora = lora_rec
+        eval_solve_fn, eval_client = self._build_solve_runner(
+            generation=generation,
+            snapshot_dir=cand_snap,
+            active_lora=lora_rec.adapter_id,
+        )
+
+        dev_summary = evaluate_suite(
+            tasks=self.dev_full_tasks,
+            split_name="dev_full",
+            solve_fn=eval_solve_fn,
+            llm_client=eval_client,
+            adapter=self.adapter,
+            verifier=self.verifier,
+            num_samples=self.config.task.num_samples_per_task,
+            max_concurrency=self.config.dataset.max_concurrency,
+            traces_dir=cand_snap / "traces",
+        )
+        (cand_snap / "dev_full_eval.json").write_text(
+            dev_summary.model_dump_json(indent=2), encoding="utf-8"
+        )
+        total_tokens = dev_summary.total_tokens
+
+        anchor_score: float | None = None
+        anchor_passed = True
+        anchor_delta = 0.0
+        if self.config.guardrails.anchor_enabled and self.anchor_tasks:
+            anchor_summary = evaluate_suite(
+                tasks=self.anchor_tasks,
+                split_name="anchor",
+                solve_fn=eval_solve_fn,
+                llm_client=eval_client,
+                adapter=self.adapter,
+                verifier=self.verifier,
+                num_samples=self.config.task.num_samples_per_task,
+                max_concurrency=self.config.dataset.max_concurrency,
+                traces_dir=None,
+            )
+            (cand_snap / "anchor_eval.json").write_text(
+                anchor_summary.model_dump_json(indent=2), encoding="utf-8"
+            )
+            anchor_score = anchor_summary.pass_rate
+            total_tokens += anchor_summary.total_tokens
+            gate = AnchorGatekeeper(max_anchor_drop=self.config.guardrails.max_anchor_drop)
+            anchor_passed, anchor_delta = gate.check(
+                new_anchor_score=anchor_score,
+                baseline_anchor_score=self._baseline_anchor_score(),
+            )
+
+        cand_status: CandidateStatus
+        failure_reason: str | None = None
+        holdout_score: float | None = None
+
+        if not anchor_passed:
+            cand_status = "rejected_anchor_drop"
+            failure_reason = (
+                f"LoRA {adapter_id} dropped Anchor by {anchor_delta:+.4f} "
+                f"(exceeds max_anchor_drop={self.config.guardrails.max_anchor_drop:.4f})"
+            )
+            lora_rec = lora_rec.model_copy(
+                update={"accepted": False, "anchor_delta": anchor_delta}
+            )
+            self._active_lora = prev_lora
+            self.lifecycle.ensure_serving(active_lora=prev_lora)
+        elif self.policy.should_accept(dev_summary.pass_rate, total_tokens, best_parent):
+            cand_status = "accepted"
+            lora_rec = lora_rec.model_copy(
+                update={"accepted": True, "anchor_delta": anchor_delta}
+            )
+            self._active_lora = lora_rec
+            if self.holdout_tasks:
+                ho_summary = evaluate_suite(
+                    tasks=self.holdout_tasks,
+                    split_name="holdout",
+                    solve_fn=eval_solve_fn,
+                    llm_client=eval_client,
+                    adapter=self.adapter,
+                    verifier=self.verifier,
+                    num_samples=self.config.task.num_samples_per_task,
+                    max_concurrency=self.config.dataset.max_concurrency,
+                    traces_dir=None,
+                )
+                (cand_snap / "holdout_eval.json").write_text(
+                    ho_summary.model_dump_json(indent=2), encoding="utf-8"
+                )
+                holdout_score = ho_summary.pass_rate
+        else:
+            cand_status = "rejected_low_score"
+            failure_reason = (
+                f"LoRA {adapter_id} dev_score={dev_summary.pass_rate:.4f} did not beat "
+                f"best={candidate_primary_score(best_parent):.4f}"
+            )
+            lora_rec = lora_rec.model_copy(
+                update={"accepted": False, "anchor_delta": anchor_delta}
+            )
+            self._active_lora = prev_lora
+            self.lifecycle.ensure_serving(active_lora=prev_lora)
+
+        self.archive.add_lora_adapter(lora_rec)
+        rec = CandidateRecord(
+            candidate_id=cand_id,
+            generation=generation,
+            parent_id=best_parent.candidate_id,
+            track="weight_lora",
+            lora_adapter_id=lora_rec.adapter_id,
+            status=cand_status,
+            snapshot_dir=rel_snap,
+            hypothesis=(
+                f"Track-B {wa_cfg.method} ({n_exported} samples, loss={lora_rec.train_loss})"
+            ),
+            dev_mini_score=dev_summary.pass_rate,
+            dev_full_score=dev_summary.pass_rate,
+            anchor_score=anchor_score,
+            holdout_score=holdout_score,
+            total_tokens=total_tokens,
+            failure_reason=failure_reason,
+        )
+        self.archive.add_candidate(rec)
+        self.archive.record_event(
+            "weight_adaptation_complete",
+            {
+                "generation": generation,
+                "adapter_id": lora_rec.adapter_id,
+                "accepted": lora_rec.accepted,
+                "dev_full_score": rec.dev_full_score,
+                "anchor_score": rec.anchor_score,
+                "anchor_delta": anchor_delta,
+                "holdout_score": rec.holdout_score,
+            },
+        )
+        return rec
+
     def run(self, max_generations: int | None = None) -> list[CandidateRecord]:
         """Run (or resume) the evolution loop up to ``max_generations``."""
         target_gens = (
@@ -614,5 +866,17 @@ class EvolutionOrchestrator:
                 no_improve_streak = 0
             else:
                 no_improve_streak += 1
+
+            # Periodic Track-B Weight Adaptation (LoRA fine-tuning + Anchor Gatekeeper)
+            wa_cfg = self.config.weight_adaptation
+            if wa_cfg.enabled and (gen % wa_cfg.trigger_every_n_generations == 0):
+                lora_cand = self._run_weight_adaptation_round(gen)
+                if (
+                    lora_cand is not None
+                    and lora_cand.status == "accepted"
+                    and candidate_primary_score(lora_cand) > best_score + 1e-9
+                ):
+                    best_score = candidate_primary_score(lora_cand)
+                    no_improve_streak = 0
 
         return self.archive.list_candidates()
