@@ -91,6 +91,7 @@ def apply_proposal_to_snapshot(
     candidate_snapshot_dir: Path,
     proposal: MutationProposal,
     max_files_per_mutation: int = 3,
+    allowed_edit_files: list[str] | None = None,
 ) -> PatchResult:
     """Copy ``parent_snapshot_dir/agent`` to ``candidate_snapshot_dir/agent`` and apply edits."""
     parent_agent = parent_snapshot_dir / "agent"
@@ -103,6 +104,16 @@ def apply_proposal_to_snapshot(
         )
 
     unique_targets = {e.target_path for e in proposal.edits}
+    if allowed_edit_files is not None:
+        allowed_set = set(allowed_edit_files)
+        disallowed = sorted(unique_targets - allowed_set)
+        if disallowed:
+            return PatchResult(
+                ok=False,
+                candidate_dir=str(candidate_snapshot_dir),
+                failure_stage="validation",
+                error=f"Disallowed edit target(s) {disallowed}; allowed: {sorted(allowed_set)}",
+            )
     if len(unique_targets) > max_files_per_mutation:
         return PatchResult(
             ok=False,
@@ -232,31 +243,45 @@ def run_dual_entry_smoke_test(
     timeout_sec: int = 15,
 ) -> tuple[bool, str | None]:
     """Verify both ``solve()`` and ``propose_improvement()`` contracts in an isolated sandbox."""
-    # 1. Smoke-test solve()
-    toy_task = {
-        "task_id": "smoke_code_001",
-        "domain": "code",
-        "category": "smoke",
-        "prompt": "Write add(a, b) returning a + b.",
-        "payload": {"entry_file": "solution.py"},
-        "num_samples": 1,
-    }
-    solve_llm = LLMBackendSpec(
-        mode="mock",
-        mock_responses=["```python\ndef add(a, b):\n    return a + b\n```"],
-    )
-    solve_res = sandbox.run_agent_solve(
-        snapshot_dir=candidate_snapshot_dir,
-        task_input=toy_task,
-        llm_spec=solve_llm,
-        timeout_sec=timeout_sec,
-    )
-    if not solve_res.ok or solve_res.payload is None:
-        return False, f"Smoke solve() failed: {solve_res.stderr or solve_res.stdout}"
-    try:
-        TaskSolution.model_validate(solve_res.payload)
-    except Exception as exc:
-        return False, f"Smoke solve() schema validation failed: {exc}"
+    # 1. Smoke-test solve() on both code and math domains (validates prompt/message types)
+    for toy_task, mock_reply in [
+        (
+            {
+                "task_id": "smoke_code_001",
+                "domain": "code",
+                "category": "smoke",
+                "prompt": "Write add(a, b) returning a + b.",
+                "payload": {"entry_file": "solution.py"},
+                "num_samples": 1,
+            },
+            "```python\ndef add(a, b):\n    return a + b\n```",
+        ),
+        (
+            {
+                "task_id": "smoke_math_001",
+                "domain": "math",
+                "category": "smoke",
+                "prompt": "Compute 2 + 2.",
+                "payload": {},
+                "num_samples": 1,
+            },
+            r"2 + 2 = \boxed{4}",
+        ),
+    ]:
+        solve_res = sandbox.run_agent_solve(
+            snapshot_dir=candidate_snapshot_dir,
+            task_input=toy_task,
+            llm_spec=LLMBackendSpec(mode="mock", mock_responses=[mock_reply]),
+            timeout_sec=timeout_sec,
+        )
+        if not solve_res.ok or solve_res.payload is None:
+            dom = toy_task["domain"]
+            detail = solve_res.stderr or solve_res.stdout
+            return False, f"Smoke solve({dom}) failed: {detail}"
+        try:
+            TaskSolution.model_validate(solve_res.payload)
+        except Exception as exc:
+            return False, f"Smoke solve({toy_task['domain']}) schema validation failed: {exc}"
 
     # 2. Smoke-test propose_improvement() to protect recursive self-improvement capability
     dummy_proposal = {
@@ -309,6 +334,7 @@ def apply_and_verify_patch(
     sandbox: SandboxExecutor,
     max_files_per_mutation: int = 3,
     smoke_timeout_sec: int = 15,
+    allowed_edit_files: list[str] | None = None,
 ) -> PatchResult:
     """Atomically apply a proposal to a candidate copy and run dual-entry smoke verification."""
     applied = apply_proposal_to_snapshot(
@@ -316,6 +342,7 @@ def apply_and_verify_patch(
         candidate_snapshot_dir=candidate_snapshot_dir,
         proposal=proposal,
         max_files_per_mutation=max_files_per_mutation,
+        allowed_edit_files=allowed_edit_files,
     )
     if not applied.ok:
         return applied

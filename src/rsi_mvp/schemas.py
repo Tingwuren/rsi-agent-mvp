@@ -311,12 +311,13 @@ class DatasetConfig(BaseModel):
 
 
 class EvolutionConfig(BaseModel):
-    max_generations: int = Field(default=10, ge=1)
+    max_generations: int = Field(default=10, ge=0)
     selection_policy: Literal["hill_climbing", "evolutionary_archive"] = "evolutionary_archive"
     holdout_eval_interval: int = Field(default=5, ge=1)
     early_stop_patience: int = Field(default=4, ge=1)
     max_files_per_mutation: int = Field(default=3, ge=1, le=20)
     max_failed_traces_in_context: int = Field(default=4, ge=1, le=20)
+    allowed_edit_files: list[str] | None = None
 
 
 class WeightAdaptationConfig(BaseModel):

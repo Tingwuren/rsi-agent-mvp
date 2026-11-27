@@ -46,7 +46,25 @@ bash scripts/run_v0_baseline.sh
 
 # 单卡 GPU 1 实机运行 3 代 Scaffold RSI
 bash scripts/run_m3_live_rsi.sh
+
+# 单卡 GPU 1 实机运行 6 组对照消融实验（Exp-1 ~ Exp-6）
+python scripts/run_ablation_suite.py
 ```
+
+---
+
+## v1.2 实机 6 组对照消融结果（`Qwen3-8B` / `MATH-500`）
+
+单卡 NVIDIA RTX 5090 32 GB（BF16），分层 `MATH-500`（`Train=100 / Dev=20 / Anchor=16 / Holdout=30`，Exp-6 无标注 `Train=60 / Dev=20`）：
+
+| 实验组 | 方法 | 最优候选 (`Track`) | Dev | Anchor | **Holdout** | **Holdout 增益** | 有效变异率 | 最优 Dev Tokens |
+| :--- | :--- | :--- | :-: | :-: | :-: | :-: | :-: | :-: |
+| **Exp-1** | Baseline v0 | `cand_0000` (`bootstrap`) | 70.0% | 62.5% | **50.0%** | +0.0% | - | 105,689 |
+| **Exp-2** | Prompt-Only SI (4g) | `cand_0004` (`scaffold`) | 80.0% | 75.0% | **70.0%** | **+20.0%** | 100.0% | **68,942 (-34.8%)** |
+| **Exp-3** | Pure Scaffold RSI (4g) | `cand_0002` (`scaffold`) | 80.0% | 68.8% | **73.3%** | **+23.3%** | 100.0% | 145,678 (+37.8%) |
+| **Exp-4** | Pure Weight LoRA | `cand_0000` (`bootstrap`) | 70.0% | 62.5% | **50.0%** | +0.0% | - | 105,689 |
+| **Exp-5** | Full Dual-Track RSI | `cand_0004` (`weight_lora/lora_0001`) | 80.0% | 75.0% | **73.3%** | **+23.3%** | 100.0% | **121,069**（较 Scaffold -19.7%） |
+| **Exp-6** | Label-Free Consensus RSI | `cand_0002` (`scaffold`) | 55.0% | 62.5% | **53.3%** | **+3.3%** | 66.7% | 140,742 (-5.7%) |
 
 ---
 

@@ -43,8 +43,9 @@ def solve(task: dict[str, Any], llm_client: Any) -> dict[str, Any]:
     outputs: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
     total_tokens = 0
-    # Use higher temperature automatically when drawing multiple samples for consensus
-    temperature = 0.2 if num_samples == 1 else 0.7
+    # Use deterministic greedy decoding for single-sample evaluation,
+    # and higher temperature when drawing K > 1 diverse samples for consensus.
+    temperature = 0.0 if num_samples == 1 else 0.7
 
     for idx in range(num_samples):
         resp = llm_client.chat(messages=messages, temperature=temperature, max_tokens=4096)

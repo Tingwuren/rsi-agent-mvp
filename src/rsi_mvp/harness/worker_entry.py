@@ -54,7 +54,12 @@ class _WorkerMockLLMClient:
         max_tokens: int = 2048,
         response_format: dict[str, Any] | None = None,
     ) -> _WorkerLLMResponse:
-        _ = (messages, temperature, max_tokens, response_format)
+        _ = (temperature, max_tokens, response_format)
+        for msg in messages:
+            if not isinstance(msg.get("role"), str) or not isinstance(msg.get("content"), str):
+                raise TypeError(
+                    f"LLM message role and content must be str, got: {msg!r}"
+                )
         if not self._responses:
             content = ""
         else:

@@ -68,6 +68,47 @@ def test_export_sft_dataset_filters_confidence_and_mixes_replay(tmp_path: Path) 
     assert user_msgs == {"Write f1", "replay_q"}
 
 
+def test_export_sft_filters_unclosed_think_and_overlong_samples(tmp_path: Path) -> None:
+    adapter = get_adapter("math")
+    specs = [
+        TaskSpec(task_id="m_short", domain="math", split="train", prompt="1+1"),
+        TaskSpec(task_id="m_unclosed", domain="math", split="train", prompt="2+2"),
+        TaskSpec(task_id="m_toolong", domain="math", split="train", prompt="3+3"),
+    ]
+    sols = [
+        TaskSolution(
+            task_id="m_short",
+            outputs=[CandidateOutput(raw_text="<think>ok</think>\\boxed{2}", extracted_answer="2")],
+        ),
+        TaskSolution(
+            task_id="m_unclosed",
+            outputs=[CandidateOutput(raw_text="<think>cut off...", extracted_answer="4")],
+        ),
+        TaskSolution(
+            task_id="m_toolong",
+            outputs=[
+                CandidateOutput(
+                    raw_text="<think>" + ("x" * 5000) + "</think>\\boxed{6}",
+                    extracted_answer="6",
+                )
+            ],
+        ),
+    ]
+    vers = [VerifyResult(task_id=s.task_id, passed=True, score=1.0) for s in specs]
+
+    out_jsonl = tmp_path / "clean_sft.jsonl"
+    count = export_sft_dataset(
+        evaluated_items=list(zip(specs, sols, vers, strict=True)),
+        adapter=adapter,
+        output_jsonl=out_jsonl,
+        max_sample_chars=2000,
+        replay_ratio=0.0,
+    )
+    assert count == 1
+    row = json.loads(out_jsonl.read_text(encoding="utf-8").strip())
+    assert row["messages"][1]["content"] == "1+1"
+
+
 def test_vllm_lifecycle_command_builder_includes_lora_and_data0_caches(tmp_path: Path) -> None:
     cfg = ExperimentConfig()
     cfg.experiment.workspace_root = str(tmp_path)

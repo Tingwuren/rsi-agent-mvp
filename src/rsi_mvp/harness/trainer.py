@@ -27,29 +27,49 @@ def export_sft_dataset(
     adapter: TaskAdapter,
     output_jsonl: Path,
     min_confidence: float = 0.7,
+    max_sample_chars: int = 12000,
+    prefer_concise: bool = True,
+    max_fresh_samples: int | None = None,
     replay_jsonl: Path | None = None,
     replay_ratio: float = 0.2,
     seed: int = 42,
 ) -> int:
-    """Export verified trajectories to ShareGPT/messages JSONL with optional Replay mixing.
+    """Export verified, non-truncated trajectories to messages JSONL with optional Replay mixing.
 
-    Only trajectories with ``verify.passed == True`` and ``verify.confidence >= min_confidence``
-    are admitted, preventing noisy or low-consensus label-free samples from poisoning weights.
+    Filters out:
+    - failed or low-confidence trajectories (``confidence < min_confidence``),
+    - truncated trajectories containing unclosed ``<think>`` blocks,
+    - overly long trajectories exceeding ``max_sample_chars`` so ``SFTConfig.max_length``
+      never chops off the final answer.
     """
-    fresh_rows: list[dict[str, Any]] = []
+    fresh_rows: list[tuple[int, dict[str, Any]]] = []
     for spec, solution, verify in evaluated_items:
         if not verify.passed:
             continue
         if verify.confidence < min_confidence - 1e-9:
             continue
         formatted = adapter.format_for_sft(spec, solution, verify)
-        if formatted.get("messages"):
-            fresh_rows.append(formatted)
+        messages = formatted.get("messages")
+        if not messages:
+            continue
+        assistant_content = str(messages[-1].get("content", ""))
+        # Reject truncated thinking chains so LoRA never learns unclosed <think>
+        if "<think>" in assistant_content and "</think>" not in assistant_content:
+            continue
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        if max_sample_chars > 0 and total_chars > max_sample_chars:
+            continue
+        fresh_rows.append((total_chars, formatted))
 
     if not fresh_rows:
         return 0
 
-    combined = list(fresh_rows)
+    if prefer_concise:
+        fresh_rows.sort(key=lambda pair: pair[0])
+    if max_fresh_samples is not None and len(fresh_rows) > max_fresh_samples:
+        fresh_rows = fresh_rows[:max_fresh_samples]
+
+    combined = [row for _, row in fresh_rows]
     if replay_jsonl is not None and replay_jsonl.is_file() and replay_ratio > 0.0:
         replay_rows: list[dict[str, Any]] = []
         with replay_jsonl.open("r", encoding="utf-8") as fh:
@@ -60,7 +80,7 @@ def export_sft_dataset(
         if replay_rows:
             rng = random.Random(seed)
             rng.shuffle(replay_rows)
-            n_replay = max(1, int(len(fresh_rows) * replay_ratio / max(1e-6, 1.0 - replay_ratio)))
+            n_replay = max(1, int(len(combined) * replay_ratio / max(1e-6, 1.0 - replay_ratio)))
             combined.extend(replay_rows[:n_replay])
 
     rng_out = random.Random(seed)

@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from rsi_mvp.agent.prompts import IMPROVER_SYSTEM_PROMPT
-from rsi_mvp.agent.tools import parse_json_object
+from rsi_mvp.agent.tools import parse_mutation_proposal
 
 
 def _format_context_prompt(context: dict[str, Any]) -> str:
@@ -38,9 +38,25 @@ def _format_context_prompt(context: dict[str, Any]) -> str:
         code_blocks.append(f"### {rel_path}\n```python\n{source_files[rel_path]}\n```")
     sections.append("\n\n".join(code_blocks))
 
+    allowed_files = context.get("allowed_edit_files")
+    if allowed_files:
+        sections.append(
+            f"IMPORTANT CONSTRAINT: You may ONLY edit these file(s): {allowed_files}. "
+            "Do NOT include edits to any other file."
+        )
+
+    prev_error = context.get("previous_attempt_error")
+    if prev_error:
+        sections.append(
+            "## Previous Attempt Failed — Fix This Error\n"
+            f"Your previous edit proposal was rejected with:\n```\n{prev_error}\n```\n"
+            "Ensure <search> matches an EXACT verbatim substring from the file above and "
+            "produces valid Python code."
+        )
+
     sections.append(
-        "Propose ONE targeted, generalizable improvement as a strict JSON object "
-        "matching the schema."
+        "Propose ONE targeted, generalizable improvement using the exact XML "
+        "<diagnosis>/<hypothesis>/<rationale>/<edit> format."
     )
     return "\n\n".join(sections)
 
@@ -55,10 +71,9 @@ def propose_improvement(context: dict[str, Any], llm_client: Any) -> dict[str, A
     resp = llm_client.chat(
         messages=messages,
         temperature=0.6,
-        max_tokens=3072,
-        response_format={"type": "json_object"},
+        max_tokens=4096,
     )
-    proposal = parse_json_object(str(resp.content))
+    proposal = parse_mutation_proposal(str(resp.content))
     for required_key in ("diagnosis", "hypothesis", "rationale", "edits"):
         if required_key not in proposal:
             raise ValueError(f"MutationProposal missing required field: {required_key!r}")

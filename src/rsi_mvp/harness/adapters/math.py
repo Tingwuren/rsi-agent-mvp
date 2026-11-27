@@ -69,7 +69,20 @@ class MathSymbolicAdapter:
     def format_for_sft(
         self, spec: TaskSpec, solution: TaskSolution, verify: VerifyResult
     ) -> dict[str, Any]:
-        assistant_text = solution.outputs[0].raw_text.strip()
+        # When K > 1 samples exist (e.g. ConsensusVerifier), select the shortest complete
+        # trace matching the consensus pseudo_label instead of blindly taking outputs[0].
+        chosen = solution.outputs[0]
+        if verify.pseudo_label and len(solution.outputs) > 1:
+            matching = [
+                o
+                for o in solution.outputs
+                if o.extracted_answer.strip() == verify.pseudo_label.strip()
+                and not ("<think>" in o.raw_text and "</think>" not in o.raw_text)
+            ]
+            if matching:
+                chosen = min(matching, key=lambda o: len(o.raw_text))
+
+        assistant_text = chosen.raw_text.strip()
         if verify.pseudo_label and f"\\boxed{{{verify.pseudo_label}}}" not in assistant_text:
             assistant_text = f"{assistant_text}\n\nFinal answer: \\boxed{{{verify.pseudo_label}}}"
         return {

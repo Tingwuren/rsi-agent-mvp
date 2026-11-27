@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -74,7 +75,7 @@ def _read_agent_sources(agent_dir: Path) -> dict[str, str]:
 def _sample_failed_cases(
     parent_snapshot_dir: Path, max_cases: int
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Load parent dev summary and sample up to ``max_cases`` failed dev traces only."""
+    """Load parent dev summary + rich telemetry and sample up to ``max_cases`` failed traces."""
     eval_file = parent_snapshot_dir / "dev_full_eval.json"
     if not eval_file.is_file():
         eval_file = parent_snapshot_dir / "dev_mini_eval.json"
@@ -82,6 +83,48 @@ def _sample_failed_cases(
         return {}, []
 
     summary = SuiteEvalSummary.model_validate_json(eval_file.read_text(encoding="utf-8"))
+    traces_dir = parent_snapshot_dir / "traces"
+
+    passed_tokens = [r.tokens_used for r in summary.results if r.passed and r.tokens_used > 0]
+    failed_tokens = [r.tokens_used for r in summary.results if not r.passed and r.tokens_used > 0]
+    truncated_count = 0
+
+    failed_results = [r for r in summary.results if not r.passed]
+    failed_cases: list[dict[str, Any]] = []
+    for idx, r in enumerate(failed_results):
+        has_unclosed_think = False
+        raw_tail = ""
+        extracted_snippet = ""
+        trace_file = traces_dir / f"{r.task_id}.json"
+        if trace_file.is_file():
+            tr = json.loads(trace_file.read_text(encoding="utf-8"))
+            outputs = tr.get("solution", {}).get("outputs") or []
+            if outputs:
+                raw_text = str(outputs[0].get("raw_text", ""))
+                has_unclosed_think = ("<think>" in raw_text) and ("</think>" not in raw_text)
+                raw_tail = raw_text[-280:]
+                extracted_snippet = str(outputs[0].get("extracted_answer", ""))[:600]
+
+        likely_truncated = has_unclosed_think or (r.tokens_used >= 3800)
+        if likely_truncated:
+            truncated_count += 1
+
+        if idx < max_cases:
+            failed_cases.append(
+                {
+                    "task_id": r.task_id,
+                    "failure_type": r.failure_type,
+                    "score": r.score,
+                    "tokens_used": r.tokens_used,
+                    "elapsed_sec": round(r.elapsed_sec, 2),
+                    "has_unclosed_think": has_unclosed_think,
+                    "likely_truncated": likely_truncated,
+                    "diagnostics": r.diagnostics[:1000],
+                    "extracted_answer": extracted_snippet,
+                    "raw_tail": raw_tail,
+                }
+            )
+
     summary_dict = {
         "split": summary.split,
         "pass_rate": summary.pass_rate,
@@ -89,26 +132,10 @@ def _sample_failed_cases(
         "passed_tasks": summary.passed_tasks,
         "total_tasks": summary.total_tasks,
         "failure_breakdown": summary.failure_breakdown,
+        "truncated_failures": truncated_count,
+        "avg_tokens_passed": int(sum(passed_tokens) / len(passed_tokens)) if passed_tokens else 0,
+        "avg_tokens_failed": int(sum(failed_tokens) / len(failed_tokens)) if failed_tokens else 0,
     }
-
-    failed_results = [r for r in summary.results if not r.passed][:max_cases]
-    failed_cases: list[dict[str, Any]] = []
-    traces_dir = parent_snapshot_dir / "traces"
-    for r in failed_results:
-        case: dict[str, Any] = {
-            "task_id": r.task_id,
-            "failure_type": r.failure_type,
-            "score": r.score,
-            "diagnostics": r.diagnostics[:1200],
-        }
-        trace_file = traces_dir / f"{r.task_id}.json"
-        if trace_file.is_file():
-            tr = json.loads(trace_file.read_text(encoding="utf-8"))
-            outputs = tr.get("solution", {}).get("outputs") or []
-            if outputs:
-                case["extracted_answer"] = str(outputs[0].get("extracted_answer", ""))[:1000]
-        failed_cases.append(case)
-
     return summary_dict, failed_cases
 
 
@@ -429,75 +456,83 @@ class EvolutionOrchestrator:
             "failed_cases": failed_cases,
             "source_files": _read_agent_sources(parent_snap / "agent"),
             "recent_history": recent_history,
+            "allowed_edit_files": self.config.evolution.allowed_edit_files,
         }
 
-        improve_spec = self._build_improve_spec(generation, parent)
-        imp_res = self.sandbox.run_agent_improve(
-            snapshot_dir=parent_snap,
-            improve_context=improve_context,
-            llm_spec=improve_spec,
-            timeout_sec=self.config.sandbox.improve_timeout_sec,
-        )
-        if not imp_res.ok or imp_res.payload is None:
-            rec = CandidateRecord(
-                candidate_id=cand_id,
-                generation=generation,
-                parent_id=parent.candidate_id,
-                track="scaffold",
-                lora_adapter_id=parent.lora_adapter_id,
-                status="error",
-                snapshot_dir=rel_snap,
-                failure_reason=f"Improver failed: {imp_res.stderr or imp_res.stdout}",
+        # Allow up to 2 attempts (initial + 1 error-feedback repair retry) for valid patch
+        proposal: MutationProposal | None = None
+        patch_res = None
+        last_fail_status: CandidateStatus = "error"
+        last_fail_reason = ""
+        prev_attempt_error: str | None = None
+
+        for _attempt in range(2):
+            attempt_ctx = dict(improve_context)
+            if prev_attempt_error:
+                attempt_ctx["previous_attempt_error"] = prev_attempt_error
+
+            improve_spec = self._build_improve_spec(generation, parent)
+            imp_res = self.sandbox.run_agent_improve(
+                snapshot_dir=parent_snap,
+                improve_context=attempt_ctx,
+                llm_spec=improve_spec,
+                timeout_sec=self.config.sandbox.improve_timeout_sec,
             )
-            self.archive.add_candidate(rec)
-            return rec
+            if not imp_res.ok or imp_res.payload is None:
+                last_fail_status = "error"
+                last_fail_reason = f"Improver failed: {imp_res.stderr or imp_res.stdout}"
+                prev_attempt_error = last_fail_reason
+                continue
 
-        try:
-            proposal = MutationProposal.model_validate(imp_res.payload)
-        except Exception as exc:
-            rec = CandidateRecord(
-                candidate_id=cand_id,
-                generation=generation,
-                parent_id=parent.candidate_id,
-                track="scaffold",
-                lora_adapter_id=parent.lora_adapter_id,
-                status="rejected_invalid",
-                snapshot_dir=rel_snap,
-                failure_reason=f"Invalid MutationProposal schema: {exc}",
+            try:
+                proposal = MutationProposal.model_validate(imp_res.payload)
+            except Exception as exc:
+                last_fail_status = "rejected_invalid"
+                last_fail_reason = f"Invalid MutationProposal schema: {exc}"
+                prev_attempt_error = last_fail_reason
+                proposal = None
+                continue
+
+            (cand_snap / "proposal.json").write_text(
+                proposal.model_dump_json(indent=2), encoding="utf-8"
             )
-            self.archive.add_candidate(rec)
-            return rec
 
-        (cand_snap / "proposal.json").write_text(
-            proposal.model_dump_json(indent=2), encoding="utf-8"
-        )
+            patch_res = apply_and_verify_patch(
+                parent_snapshot_dir=parent_snap,
+                candidate_snapshot_dir=cand_snap,
+                proposal=proposal,
+                sandbox=self.sandbox,
+                max_files_per_mutation=self.config.evolution.max_files_per_mutation,
+                smoke_timeout_sec=min(20, self.config.sandbox.task_timeout_sec),
+                allowed_edit_files=self.config.evolution.allowed_edit_files,
+            )
+            if patch_res.ok:
+                break
 
-        # Apply patch + AST/boundary check + dual-entry smoke test
-        patch_res = apply_and_verify_patch(
-            parent_snapshot_dir=parent_snap,
-            candidate_snapshot_dir=cand_snap,
-            proposal=proposal,
-            sandbox=self.sandbox,
-            max_files_per_mutation=self.config.evolution.max_files_per_mutation,
-            smoke_timeout_sec=min(20, self.config.sandbox.task_timeout_sec),
-        )
-        if not patch_res.ok:
-            fail_status: CandidateStatus = (
+            last_fail_status = (
                 "rejected_smoke_failed"
                 if patch_res.failure_stage == "smoke"
                 else "rejected_invalid"
             )
+            last_fail_reason = f"[{patch_res.failure_stage}] {patch_res.error}"
+            prev_attempt_error = last_fail_reason
+
+        if proposal is None or patch_res is None or not patch_res.ok:
             rec = CandidateRecord(
                 candidate_id=cand_id,
                 generation=generation,
                 parent_id=parent.candidate_id,
                 track="scaffold",
                 lora_adapter_id=parent.lora_adapter_id,
-                status=fail_status,
+                status=last_fail_status,
                 snapshot_dir=rel_snap,
-                diff_path=f"{rel_snap}/patch.diff" if patch_res.diff_path else None,
-                hypothesis=proposal.hypothesis,
-                failure_reason=f"[{patch_res.failure_stage}] {patch_res.error}",
+                diff_path=(
+                    f"{rel_snap}/patch.diff"
+                    if (patch_res is not None and patch_res.diff_path)
+                    else None
+                ),
+                hypothesis=proposal.hypothesis if proposal is not None else "",
+                failure_reason=last_fail_reason,
             )
             self.archive.add_candidate(rec)
             return rec
@@ -563,9 +598,16 @@ class EvolutionOrchestrator:
                 f"score={primary_score:.4f} did not beat best={best_score_before:.4f}"
             )
 
-        # Periodic or new-best Holdout evaluation (black-box, never fed back to improver)
+        # Periodic or new-best (including token-efficiency tie-break) Holdout evaluation
         holdout_score: float | None = None
-        is_new_best = status == "accepted" and primary_score > best_score_before + 1e-9
+        is_new_best = status == "accepted" and (
+            primary_score > best_score_before + 1e-9
+            or (
+                best_before is not None
+                and abs(primary_score - best_score_before) <= 1e-9
+                and total_tokens < best_before.total_tokens
+            )
+        )
         is_periodic = (
             generation % self.config.evolution.holdout_eval_interval == 0
             or generation == self.config.evolution.max_generations
@@ -636,18 +678,40 @@ class EvolutionOrchestrator:
             active_lora=prev_lora.adapter_id if prev_lora else None,
         )
 
-        # 1. Collect verified Train trajectories using the best scaffold
-        evaluated_train: list[tuple[TaskSpec, TaskSolution, VerifyResult]] = []
-        for spec in self.train_tasks:
-            sol, ver = evaluate_single_task(
-                spec=spec,
-                solve_fn=solve_fn,
-                llm_client=llm_client,
-                adapter=self.adapter,
-                verifier=self.verifier,
-                num_samples=self.config.task.num_samples_per_task,
-            )
-            evaluated_train.append((spec, sol, ver))
+        # 1. Collect verified Train trajectories concurrently using the best scaffold
+        evaluated_map: dict[str, tuple[TaskSpec, TaskSolution, VerifyResult]] = {}
+        workers = max(1, min(self.config.dataset.max_concurrency, len(self.train_tasks)))
+        if workers <= 1:
+            for spec in self.train_tasks:
+                sol, ver = evaluate_single_task(
+                    spec=spec,
+                    solve_fn=solve_fn,
+                    llm_client=llm_client,
+                    adapter=self.adapter,
+                    verifier=self.verifier,
+                    num_samples=self.config.task.num_samples_per_task,
+                )
+                evaluated_map[spec.task_id] = (spec, sol, ver)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {
+                    pool.submit(
+                        evaluate_single_task,
+                        spec,
+                        solve_fn,
+                        llm_client,
+                        self.adapter,
+                        self.verifier,
+                        self.config.task.num_samples_per_task,
+                    ): spec
+                    for spec in self.train_tasks
+                }
+                for fut in as_completed(futs):
+                    spec = futs[fut]
+                    sol, ver = fut.result()
+                    evaluated_map[spec.task_id] = (spec, sol, ver)
+
+        evaluated_train = [evaluated_map[s.task_id] for s in self.train_tasks]
 
         sft_jsonl = self.run_dir / "sft_data" / f"gen_{generation:04d}.jsonl"
         n_exported = export_sft_dataset(

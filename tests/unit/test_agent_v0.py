@@ -64,3 +64,35 @@ def test_agent_v0_propose_improvement_parses_json() -> None:
     )
     proposal = MutationProposal.model_validate(raw)
     assert proposal.edits[0].target_path == "prompts.py"
+
+
+def test_agent_v0_propose_improvement_parses_escape_free_xml_blocks() -> None:
+    xml_resp = """\
+<think>Let me analyze the backslash bug carefully.</think>
+<diagnosis>JSON escaping broke \\boxed{...} marker.</diagnosis>
+<hypothesis>Use raw XML blocks to preserve backslashes verbatim.</hypothesis>
+<rationale>Eliminates escape corruption during code edits.</rationale>
+<edit target="tools.py" mode="replace_block">
+<search>
+marker = "\\boxed{"
+</search>
+<replace>
+marker = "\\boxed{"  # preserved verbatim
+</replace>
+</edit>
+"""
+    client = MockLLMClient(responses=[xml_resp])
+    raw = propose_improvement(
+        {
+            "parent_id": "cand_0000",
+            "dev_summary": {"pass_rate": 0.75, "truncated_failures": 4},
+            "failed_cases": [{"task_id": "m1", "likely_truncated": True}],
+            "source_files": {"tools.py": 'marker = "\\boxed{"\n'},
+            "recent_history": [],
+        },
+        client,
+    )
+    proposal = MutationProposal.model_validate(raw)
+    assert proposal.edits[0].target_path == "tools.py"
+    assert proposal.edits[0].search == 'marker = "\\boxed{"'
+    assert proposal.edits[0].replace == 'marker = "\\boxed{"  # preserved verbatim'
